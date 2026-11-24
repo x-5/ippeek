@@ -99,53 +99,17 @@ func (p *Prober) Probe(ctx context.Context, family IPFamily, ifaceName string, l
 
 	key := probeKey{family: family, iface: ifaceName}
 
-	if !refresh {
-		p.mu.Lock()
-		if p.cacheTTL > 0 {
-			if entry, ok := p.cache[key]; ok && p.now().Before(entry.expiresAt) {
-				res := entry.res
-				res.Cached = true
-				p.mu.Unlock()
-				return res, nil
-			}
-		}
-		if call, ok := p.inflight[key]; ok {
+	p.mu.Lock()
+	if !refresh && p.cacheTTL > 0 {
+		if entry, ok := p.cache[key]; ok && p.now().Before(entry.expiresAt) {
+			res := entry.res
+			res.Cached = true
 			p.mu.Unlock()
-			select {
-			case <-call.done:
-				return call.res, call.err
-			case <-ctx.Done():
-				return ProbeResult{}, ctx.Err()
-			}
+			return res, nil
 		}
-		call := &inflightCall{done: make(chan struct{})}
-		p.inflight[key] = call
+	}
+	if call, ok := p.inflight[key]; ok {
 		p.mu.Unlock()
-
-		go func() {
-			budget := p.timeout * time.Duration(len(probes))
-			if budget < p.timeout {
-				budget = p.timeout
-			}
-			probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
-			defer cancel()
-
-			res, err := p.probeAll(probeCtx, family, probes, ifaceName, localIP)
-
-			p.mu.Lock()
-			if err == nil && p.cacheTTL > 0 {
-				p.cache[key] = cacheEntry{
-					res:       res,
-					expiresAt: p.now().Add(p.cacheTTL),
-				}
-			}
-			call.res = res
-			call.err = err
-			delete(p.inflight, key)
-			close(call.done)
-			p.mu.Unlock()
-		}()
-
 		select {
 		case <-call.done:
 			return call.res, call.err
@@ -153,18 +117,50 @@ func (p *Prober) Probe(ctx context.Context, family IPFamily, ifaceName string, l
 			return ProbeResult{}, ctx.Err()
 		}
 	}
-
-	// Forced refresh path: bypass cache and overwrite cached value on success.
-	res, err := p.probeAll(ctx, family, probes, ifaceName, localIP)
-	if err == nil && p.cacheTTL > 0 {
-		p.mu.Lock()
-		p.cache[key] = cacheEntry{
-			res:       res,
-			expiresAt: p.now().Add(p.cacheTTL),
-		}
+	if err := ctx.Err(); err != nil {
 		p.mu.Unlock()
+		return ProbeResult{}, err
 	}
-	return res, err
+	call := &inflightCall{done: make(chan struct{})}
+	p.inflight[key] = call
+	p.mu.Unlock()
+
+	go func() {
+		budget := p.timeout * time.Duration(len(probes))
+		if budget < p.timeout {
+			budget = p.timeout
+		}
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+		defer cancel()
+
+		res, err := p.probeAll(probeCtx, family, probes, ifaceName, localIP)
+
+		p.mu.Lock()
+		if err == nil && p.cacheTTL > 0 {
+			now := p.now()
+			for k, e := range p.cache {
+				if !now.Before(e.expiresAt) {
+					delete(p.cache, k)
+				}
+			}
+			p.cache[key] = cacheEntry{
+				res:       res,
+				expiresAt: now.Add(p.cacheTTL),
+			}
+		}
+		call.res = res
+		call.err = err
+		delete(p.inflight, key)
+		close(call.done)
+		p.mu.Unlock()
+	}()
+
+	select {
+	case <-call.done:
+		return call.res, call.err
+	case <-ctx.Done():
+		return ProbeResult{}, ctx.Err()
+	}
 }
 
 func (p *Prober) probesFor(family IPFamily) []string {

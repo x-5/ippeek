@@ -329,3 +329,113 @@ func TestProberInflightCoalescing(t *testing.T) {
 		t.Fatalf("expected concurrent probes to coalesce into 1 upstream request, got %d", got)
 	}
 }
+
+func TestProberConcurrentRefreshCoalescing(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		if n == 1 {
+			_, _ = w.Write([]byte("1.1.1.1"))
+			return
+		}
+		time.Sleep(60 * time.Millisecond)
+		_, _ = w.Write([]byte("2.2.2.2"))
+	}))
+	defer srv.Close()
+
+	prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 60*time.Second)
+
+	// Warm the cache first.
+	r1, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil || r1.IP != "1.1.1.1" || r1.Cached {
+		t.Fatalf("initial probe unexpected: res=%+v err=%v", r1, err)
+	}
+
+	// Fire 8 concurrent refresh=true calls simultaneously; they must coalesce into 1 upstream request.
+	const callers = 8
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			res, err := prober.Probe(context.Background(), FamilyV4, "", nil, true)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if res.IP != "2.2.2.2" || res.Cached {
+				errs <- errors.New("unexpected refresh result: " + res.IP)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent refresh failed: %v", err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expected 2 total hits (1 initial + 1 coalesced refresh), got %d", got)
+	}
+
+	// Subsequent non-refresh call must read the refreshed cached IP without hitting upstream.
+	r2, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil || r2.IP != "2.2.2.2" || !r2.Cached {
+		t.Fatalf("post-refresh cached probe unexpected: res=%+v err=%v", r2, err)
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expected still 2 total hits after cached read, got %d", got)
+	}
+}
+
+func TestProberCacheExpiredGC(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("4.4.4.4"))
+	}))
+	defer srv.Close()
+
+	base := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	curTime := base
+	prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 30*time.Second)
+	prober.now = func() time.Time { return curTime }
+
+	// Seed expired entries and one non-expired entry.
+	prober.mu.Lock()
+	prober.cache[probeKey{family: FamilyV4, iface: "stale-a"}] = cacheEntry{
+		res:       ProbeResult{IP: "1.1.1.1"},
+		expiresAt: base.Add(10 * time.Second),
+	}
+	prober.cache[probeKey{family: FamilyV6, iface: "stale-b"}] = cacheEntry{
+		res:       ProbeResult{IP: "240e::1"},
+		expiresAt: base.Add(20 * time.Second),
+	}
+	prober.cache[probeKey{family: FamilyV4, iface: "still-fresh"}] = cacheEntry{
+		res:       ProbeResult{IP: "3.3.3.3"},
+		expiresAt: base.Add(90 * time.Second),
+	}
+	prober.mu.Unlock()
+
+	// Advance clock past stale-a and stale-b expiry, before still-fresh expiry.
+	curTime = base.Add(25 * time.Second)
+
+	res, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil || res.IP != "4.4.4.4" {
+		t.Fatalf("probe failed: res=%+v err=%v", res, err)
+	}
+
+	prober.mu.Lock()
+	defer prober.mu.Unlock()
+	if _, ok := prober.cache[probeKey{family: FamilyV4, iface: "stale-a"}]; ok {
+		t.Fatal("expected expired entry stale-a to be swept on cache write")
+	}
+	if _, ok := prober.cache[probeKey{family: FamilyV6, iface: "stale-b"}]; ok {
+		t.Fatal("expected expired entry stale-b to be swept on cache write")
+	}
+	if _, ok := prober.cache[probeKey{family: FamilyV4, iface: "still-fresh"}]; !ok {
+		t.Fatal("expected non-expired entry still-fresh to remain in cache")
+	}
+	if _, ok := prober.cache[probeKey{family: FamilyV4, iface: ""}]; !ok {
+		t.Fatal("expected newly written entry to be present in cache")
+	}
+}
