@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"sort"
@@ -23,33 +22,33 @@ const (
 	SourceExternal SourceMode = "external"
 )
 
-// InterfaceInfo is the JSON representation of a local network interface.
+// InterfaceInfo describes a host network interface.
 type InterfaceInfo struct {
-	Name string   `json:"name"`
-	Up   bool     `json:"up"`
-	MAC  string   `json:"mac,omitempty"`
-	IPv4 []string `json:"ipv4,omitempty"`
-	IPv6 []string `json:"ipv6,omitempty"`
+	Name string
+	Up   bool
+	MAC  string
+	IPv4 []string
+	IPv6 []string
 }
 
 // IPResult represents the resolved IPv4 or IPv6 entry.
 type IPResult struct {
-	IP     string `json:"ip,omitempty"`
-	Source string `json:"source,omitempty"`
-	Iface  string `json:"iface,omitempty"`
-	Probe  string `json:"probe,omitempty"`
-	Cached bool   `json:"cached,omitempty"`
-	Error  string `json:"error,omitempty"`
+	IP     string
+	Source string
+	Iface  string
+	Probe  string
+	Cached bool
+	Error  string
 }
 
-// OverviewResponse is the full JSON payload returned when format=json.
+// OverviewResponse is the full JSON response structure.
 type OverviewResponse struct {
-	IPv4       *IPResult       `json:"ipv4,omitempty"`
-	IPv6       *IPResult       `json:"ipv6,omitempty"`
-	Interfaces []InterfaceInfo `json:"interfaces,omitempty"`
-	ClientIP   string          `json:"client_ip,omitempty"`
-	Hostname   string          `json:"hostname,omitempty"`
-	Timestamp  string          `json:"timestamp"`
+	IPv4       *IPResult
+	IPv6       *IPResult
+	Interfaces []InterfaceInfo
+	ClientIP   string
+	Hostname   string
+	Timestamp  string
 }
 
 // NetInterface is the normalized internal representation of a host network interface.
@@ -62,7 +61,7 @@ type NetInterface struct {
 	IPv6     []netip.Addr
 }
 
-// InterfaceProvider abstracts host network interface enumeration for testability.
+// InterfaceProvider abstracts host network interface enumeration.
 type InterfaceProvider interface {
 	List() ([]NetInterface, error)
 }
@@ -121,24 +120,21 @@ func (OSInterfaceProvider) List() ([]NetInterface, error) {
 	return out, nil
 }
 
-// nonPublicPrefixes lists reserved ranges not covered by netip.Addr.IsPrivate().
 var nonPublicPrefixes = []netip.Prefix{
-	// IPv4 reserved / non-globally-routable ranges
-	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 CGNAT (carrier NAT / Tailscale)
+	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 CGNAT
 	netip.MustParsePrefix("192.0.0.0/24"),    // IETF Protocol Assignments
 	netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
 	netip.MustParsePrefix("198.18.0.0/15"),   // Benchmarking
 	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
 	netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
-	netip.MustParsePrefix("240.0.0.0/4"),     // Reserved for future use
-	// IPv6 reserved / non-globally-routable ranges
-	netip.MustParsePrefix("100::/64"),      // Discard-Only
-	netip.MustParsePrefix("2001:db8::/32"), // Documentation
-	netip.MustParsePrefix("2001:2::/48"),   // Benchmarking
-	netip.MustParsePrefix("2001::/32"),     // Teredo
+	netip.MustParsePrefix("240.0.0.0/4"),     // Reserved
+	netip.MustParsePrefix("100::/64"),        // Discard-Only
+	netip.MustParsePrefix("2001:db8::/32"),   // Documentation
+	netip.MustParsePrefix("2001:2::/48"),     // Benchmarking
+	netip.MustParsePrefix("2001::/32"),       // Teredo
 }
 
-// IsPublicIP reports whether addr is a globally routable public IPv4 or IPv6 unicast address.
+// IsPublicIP reports whether addr is a globally routable public unicast IP.
 func IsPublicIP(addr netip.Addr) bool {
 	if !addr.IsValid() || addr.Is4In6() {
 		return false
@@ -177,7 +173,7 @@ func isVirtualIface(name string) bool {
 
 // ResolveOptions specifies parameters for IP resolution.
 type ResolveOptions struct {
-	Version string // "4", "6", or "all"
+	Version string
 	Iface   string
 	Source  SourceMode
 	Refresh bool
@@ -204,11 +200,11 @@ func NewResolver(ifaces InterfaceProvider, prober ExternalProber) *Resolver {
 	}
 }
 
-// Resolve computes the requested IPv4/IPv6 addresses and interface overview.
+// Resolve computes requested IPv4/IPv6 addresses and interface overview.
 func (r *Resolver) Resolve(ctx context.Context, opts ResolveOptions) (ResolveOutput, error) {
 	allIfaces, err := r.ifaces.List()
 	if err != nil {
-		return ResolveOutput{}, fmt.Errorf("list interfaces: %w", err)
+		return ResolveOutput{}, errors.New("list interfaces: " + err.Error())
 	}
 
 	var candidates []NetInterface
@@ -280,7 +276,7 @@ func (r *Resolver) resolveFamily(
 		}
 		return IPResult{
 			Iface: opts.Iface,
-			Error: fmt.Sprintf("no local %s address available", family),
+			Error: "no local " + family.label() + " address available",
 		}
 
 	case SourceAuto:
@@ -310,7 +306,7 @@ func (r *Resolver) probeExternal(
 	if r.prober == nil {
 		return IPResult{
 			Iface: opts.Iface,
-			Error: fmt.Sprintf("external %s prober not configured", family),
+			Error: "external " + family.label() + " prober not configured",
 		}
 	}
 
@@ -394,7 +390,6 @@ func pickAddr(addrs []netip.Addr, publicOnly bool) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 
-	// Local mode preference: public > non-link-local unicast (private/CGNAT/ULA) > loopback > link-local.
 	bestScore := -1
 	var best netip.Addr
 	for _, a := range addrs {

@@ -1,19 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// IPFamily represents an IP protocol version (IPv4 or IPv6).
+// IPFamily represents IPv4 or IPv6.
 type IPFamily int
 
 const (
@@ -28,7 +28,7 @@ func (f IPFamily) network() string {
 	return "tcp4"
 }
 
-func (f IPFamily) String() string {
+func (f IPFamily) label() string {
 	if f == FamilyV6 {
 		return "ipv6"
 	}
@@ -42,7 +42,7 @@ type ProbeResult struct {
 	Cached bool
 }
 
-// ExternalProber abstracts public IP probing for testability.
+// ExternalProber abstracts external public IP probing.
 type ExternalProber interface {
 	Probe(ctx context.Context, family IPFamily, ifaceName string, localIP net.IP, refresh bool) (ProbeResult, error)
 }
@@ -63,8 +63,7 @@ type inflightCall struct {
 	err  error
 }
 
-// Prober queries external HTTP(S) IP echo endpoints with multi-source fallback,
-// in-memory TTL caching, and concurrent request coalescing.
+// Prober performs minimal raw-TCP HTTP/1.1 IP probing without net/http or crypto/tls.
 type Prober struct {
 	v4Probes []string
 	v6Probes []string
@@ -77,7 +76,7 @@ type Prober struct {
 	inflight map[probeKey]*inflightCall
 }
 
-// NewProber constructs a Prober with the provided probe endpoints and timings.
+// NewProber constructs a Prober.
 func NewProber(v4Probes, v6Probes []string, timeout, cacheTTL time.Duration) *Prober {
 	return &Prober{
 		v4Probes: append([]string(nil), v4Probes...),
@@ -94,7 +93,7 @@ func NewProber(v4Probes, v6Probes []string, timeout, cacheTTL time.Duration) *Pr
 func (p *Prober) Probe(ctx context.Context, family IPFamily, ifaceName string, localIP net.IP, refresh bool) (ProbeResult, error) {
 	probes := p.probesFor(family)
 	if len(probes) == 0 {
-		return ProbeResult{}, fmt.Errorf("no %s probe endpoints configured", family)
+		return ProbeResult{}, errors.New("no " + family.label() + " probe endpoints configured")
 	}
 
 	key := probeKey{family: family, iface: ifaceName}
@@ -154,7 +153,6 @@ func (p *Prober) Probe(ctx context.Context, family IPFamily, ifaceName string, l
 		}
 	}
 
-	// Forced refresh path: bypass cache and overwrite cached value on success.
 	res, err := p.probeAll(ctx, family, probes, ifaceName, localIP)
 	if err == nil && p.cacheTTL > 0 {
 		p.mu.Lock()
@@ -185,34 +183,12 @@ func (p *Prober) probeAll(ctx context.Context, family IPFamily, probes []string,
 		dialer.Control = ctrl
 	}
 
-	netType := family.network()
-	transport := &http.Transport{
-		DialContext: func(dialCtx context.Context, _, addr string) (net.Conn, error) {
-			return dialer.DialContext(dialCtx, netType, addr)
-		},
-		DisableKeepAlives:     true,
-		TLSHandshakeTimeout:   p.timeout,
-		ResponseHeaderTimeout: p.timeout,
-	}
-	defer transport.CloseIdleConnections()
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   p.timeout,
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("too many redirects")
-			}
-			return nil
-		},
-	}
-
 	var lastErr error
 	for _, probeURL := range probes {
 		if ctx.Err() != nil {
 			return ProbeResult{}, ctx.Err()
 		}
-		ipStr, err := probeOne(ctx, client, family, probeURL)
+		ipStr, err := probeHTTP(ctx, dialer, family, probeURL, p.timeout, 0)
 		if err == nil {
 			return ProbeResult{
 				IP:     ipStr,
@@ -220,52 +196,204 @@ func (p *Prober) probeAll(ctx context.Context, family IPFamily, probes []string,
 				Cached: false,
 			}, nil
 		}
-		lastErr = fmt.Errorf("%s: %w", probeURL, err)
+		lastErr = errors.New(probeURL + ": " + err.Error())
 	}
 
 	if lastErr == nil {
-		lastErr = fmt.Errorf("all %s probes failed", family)
+		lastErr = errors.New("all " + family.label() + " probes failed")
 	}
 	return ProbeResult{}, lastErr
 }
 
-func probeOne(ctx context.Context, client *http.Client, family IPFamily, probeURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+func parseHTTPURL(raw string) (hostHeader, dialAddr, reqPath string, err error) {
+	if strings.HasPrefix(raw, "https://") {
+		return "", "", "", errors.New("https probes not supported in go-tiny build")
+	}
+	rest, ok := strings.CutPrefix(raw, "http://")
+	if !ok || rest == "" {
+		return "", "", "", errors.New("probe URL must start with http://")
+	}
+
+	var hostPort string
+	if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+		hostPort = rest[:idx]
+		reqPath = rest[idx:]
+	} else {
+		hostPort = rest
+		reqPath = "/"
+	}
+	if hostPort == "" {
+		return "", "", "", errors.New("empty host in probe URL")
+	}
+	hostHeader = hostPort
+	if _, _, splitErr := net.SplitHostPort(hostPort); splitErr == nil {
+		dialAddr = hostPort
+	} else {
+		// Handle bracketed IPv6 literal without port or bare hostname.
+		h := strings.TrimPrefix(strings.TrimSuffix(hostPort, "]"), "[")
+		dialAddr = net.JoinHostPort(h, "80")
+	}
+	return hostHeader, dialAddr, reqPath, nil
+}
+
+func probeHTTP(ctx context.Context, dialer *net.Dialer, family IPFamily, rawURL string, timeout time.Duration, depth int) (string, error) {
+	if depth > 3 {
+		return "", errors.New("too many redirects")
+	}
+	hostHeader, dialAddr, reqPath, err := parseHTTPURL(rawURL)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "ip-api/1.0")
-	req.Header.Set("Accept", "text/plain")
 
-	resp, err := client.Do(req)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	conn, err := dialer.DialContext(reqCtx, family.network(), dialAddr)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer conn.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	if dl, ok := reqCtx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(timeout))
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 128))
+	var req strings.Builder
+	req.Grow(128)
+	req.WriteString("GET ")
+	req.WriteString(reqPath)
+	req.WriteString(" HTTP/1.1\r\nHost: ")
+	req.WriteString(hostHeader)
+	req.WriteString("\r\nUser-Agent: ip-api/1.0\r\nAccept: text/plain\r\nConnection: close\r\n\r\n")
+
+	if _, err := io.WriteString(conn, req.String()); err != nil {
+		return "", err
+	}
+
+	br := bufio.NewReaderSize(conn, 1024)
+	statusLine, err := readHeaderLine(br, 512)
 	if err != nil {
 		return "", err
 	}
 
-	text := strings.TrimSpace(string(raw))
+	// Expected: HTTP/1.x STATUS ...
+	parts := strings.SplitN(statusLine, " ", 3)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/1.") {
+		return "", errors.New("invalid HTTP status line")
+	}
+	statusCode, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", errors.New("invalid HTTP status code")
+	}
+
+	var chunked bool
+	var location string
+	for i := 0; i < 64; i++ {
+		line, err := readHeaderLine(br, 1024)
+		if err != nil {
+			return "", err
+		}
+		if line == "" {
+			break
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		switch k {
+		case "transfer-encoding":
+			if strings.Contains(strings.ToLower(v), "chunked") {
+				chunked = true
+			}
+		case "location":
+			location = v
+		}
+	}
+
+	if (statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) && location != "" {
+		return probeHTTP(ctx, dialer, family, location, timeout, depth+1)
+	}
+	if statusCode != 200 {
+		return "", errors.New("unexpected HTTP status " + strconv.Itoa(statusCode))
+	}
+
+	var rawBody []byte
+	if chunked {
+		rawBody, err = readChunkedLimited(br, 128)
+	} else {
+		rawBody, err = io.ReadAll(io.LimitReader(br, 128))
+	}
+	if err != nil {
+		return "", err
+	}
+
+	text := strings.TrimSpace(string(rawBody))
 	addr, err := netip.ParseAddr(text)
 	if err != nil {
-		return "", fmt.Errorf("invalid IP response %q", text)
+		return "", errors.New("invalid IP response")
 	}
 	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.Is4In6() {
-		return "", fmt.Errorf("unusable IP response %q", text)
+		return "", errors.New("unusable IP response")
 	}
 	if family == FamilyV4 && !addr.Is4() {
-		return "", fmt.Errorf("expected IPv4, got %q", text)
+		return "", errors.New("expected IPv4")
 	}
 	if family == FamilyV6 && !addr.Is6() {
-		return "", fmt.Errorf("expected IPv6, got %q", text)
+		return "", errors.New("expected IPv6")
 	}
-
 	return addr.String(), nil
+}
+
+func readHeaderLine(br *bufio.Reader, maxLen int) (string, error) {
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	if len(line) > maxLen {
+		return "", errors.New("header line too long")
+	}
+	line = strings.TrimSuffix(line, "\n")
+	line = strings.TrimSuffix(line, "\r")
+	return line, nil
+}
+
+func readChunkedLimited(br *bufio.Reader, limit int) ([]byte, error) {
+	var out []byte
+	for len(out) < limit {
+		sizeLine, err := readHeaderLine(br, 64)
+		if err != nil {
+			return nil, err
+		}
+		if semi := strings.IndexByte(sizeLine, ';'); semi >= 0 {
+			sizeLine = sizeLine[:semi]
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(sizeLine), 16, 64)
+		if err != nil || n < 0 {
+			return nil, errors.New("invalid chunk size")
+		}
+		if n == 0 {
+			break
+		}
+		need := int(n)
+		if len(out)+need > limit {
+			need = limit - len(out)
+		}
+		buf := make([]byte, need)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			return nil, err
+		}
+		out = append(out, buf...)
+		if int64(need) < n {
+			break
+		}
+		// Consume trailing CRLF after chunk payload.
+		if _, err := readHeaderLine(br, 16); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }

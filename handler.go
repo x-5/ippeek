@@ -1,17 +1,24 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
-	"log"
+	"io"
 	"net"
-	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+)
+
+const (
+	maxReqHeadersBytes = 4096
+	maxReqHeaderLines  = 64
 )
 
 var allowedQueryKeys = map[string]struct{}{
@@ -23,72 +30,131 @@ var allowedQueryKeys = map[string]struct{}{
 	"refresh": {},
 }
 
-// ServerHandler serves the single /ip endpoint and drops all non-conforming requests (Nginx 444 semantics).
+// ServerHandler serves the single /ip endpoint over raw TCP connections
+// and drops all non-conforming requests with 0 response bytes (Nginx 444 semantics).
 type ServerHandler struct {
 	token      []byte
 	resolver   *Resolver
 	trustProxy bool
-	logger     *log.Logger
+	logOut     io.Writer
+	logMu      sync.Mutex
 	hostname   string
 	now        func() time.Time
 }
 
 // NewServerHandler constructs a ServerHandler.
-func NewServerHandler(token string, resolver *Resolver, trustProxy bool, logger *log.Logger) *ServerHandler {
+func NewServerHandler(token string, resolver *Resolver, trustProxy bool, logOut io.Writer) *ServerHandler {
 	hostname, _ := os.Hostname()
 	return &ServerHandler{
 		token:      []byte(token),
 		resolver:   resolver,
 		trustProxy: trustProxy,
-		logger:     logger,
+		logOut:     logOut,
 		hostname:   hostname,
 		now:        time.Now,
 	}
 }
 
-// ServeHTTP validates every incoming request strictly and drops non-conforming connections with 0 bytes written.
-func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/ip" {
-		h.drop(w, r, "invalid_path")
-		return
-	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		h.drop(w, r, "invalid_method")
-		return
+// HandleConn processes a single TCP connection and closes it when done.
+func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	remoteAddr := ""
+	if conn.RemoteAddr() != nil {
+		remoteAddr = conn.RemoteAddr().String()
 	}
 
-	q, err := url.ParseQuery(r.URL.RawQuery)
+	br := bufio.NewReaderSize(io.LimitReader(conn, maxReqHeadersBytes), 1024)
+	reqLine, err := readHeaderLine(br, 1024)
 	if err != nil {
-		h.drop(w, r, "malformed_query")
+		h.logDrop("malformed_request", remoteAddr, "", "", "")
 		return
 	}
 
-	for key, vals := range q {
-		if _, ok := allowedQueryKeys[key]; !ok || len(vals) != 1 {
-			h.drop(w, r, "invalid_query_key")
+	method, target, proto, ok := parseRequestLine(reqLine)
+	if !ok {
+		h.logDrop("malformed_request_line", remoteAddr, "", "", "")
+		return
+	}
+	_ = proto
+
+	var xff, xri string
+	headersDone := false
+	for i := 0; i < maxReqHeaderLines; i++ {
+		line, err := readHeaderLine(br, 1024)
+		if err != nil {
+			h.logDrop("malformed_headers", remoteAddr, method, target, "")
 			return
 		}
+		if line == "" {
+			headersDone = true
+			break
+		}
+		k, v, hasColon := strings.Cut(line, ":")
+		if !hasColon {
+			h.logDrop("malformed_header_line", remoteAddr, method, target, "")
+			return
+		}
+		if h.trustProxy {
+			lk := strings.ToLower(strings.TrimSpace(k))
+			switch lk {
+			case "x-forwarded-for":
+				if xff == "" {
+					xff = strings.TrimSpace(v)
+				}
+			case "x-real-ip":
+				if xri == "" {
+					xri = strings.TrimSpace(v)
+				}
+			}
+		}
+	}
+	if !headersDone {
+		h.logDrop("too_many_headers", remoteAddr, method, target, "")
+		return
 	}
 
-	gotToken := q.Get("token")
+	path, rawQuery, _ := strings.Cut(target, "?")
+	clientIP := extractClientIP(remoteAddr, xff, xri, h.trustProxy)
+
+	if path != "/ip" {
+		h.logDrop("invalid_path", clientIP, method, path, rawQuery)
+		return
+	}
+	if method != "GET" && method != "HEAD" {
+		h.logDrop("invalid_method", clientIP, method, path, rawQuery)
+		return
+	}
+
+	q, ok := parseStrictQuery(rawQuery)
+	if !ok {
+		h.logDrop("invalid_query", clientIP, method, path, rawQuery)
+		return
+	}
+
+	gotToken := q["token"]
 	if len(gotToken) == 0 || subtle.ConstantTimeCompare([]byte(gotToken), h.token) != 1 {
-		h.drop(w, r, "unauthorized")
+		h.logDrop("unauthorized", clientIP, method, path, rawQuery)
 		return
 	}
 
 	opts, format, ok := parseValidParams(q)
 	if !ok {
-		h.drop(w, r, "invalid_param_value")
+		h.logDrop("invalid_param_value", clientIP, method, path, rawQuery)
 		return
 	}
 
-	res, err := h.resolver.Resolve(r.Context(), opts)
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	res, err := h.resolver.Resolve(reqCtx, opts)
 	if err != nil {
 		if errors.Is(err, ErrInterfaceNotFound) {
-			h.writeError(w, r, format, http.StatusNotFound, err.Error())
+			h.writeError(conn, method, format, 404, "Not Found", err.Error(), clientIP, path, rawQuery)
 			return
 		}
-		h.writeError(w, r, format, http.StatusInternalServerError, err.Error())
+		h.writeError(conn, method, format, 500, "Internal Server Error", err.Error(), clientIP, path, rawQuery)
 		return
 	}
 
@@ -97,19 +163,117 @@ func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			IPv4:       res.IPv4,
 			IPv6:       res.IPv6,
 			Interfaces: res.Interfaces,
-			ClientIP:   extractClientIP(r, h.trustProxy),
+			ClientIP:   clientIP,
 			Hostname:   h.hostname,
 			Timestamp:  h.now().UTC().Format(time.RFC3339),
 		}
-		h.writeJSON(w, r, http.StatusOK, payload)
+		body := marshalOverviewJSON(payload)
+		h.writeResponse(conn, method, 200, "OK", "application/json; charset=utf-8", body, clientIP, path, rawQuery)
 		return
 	}
 
-	h.writeTextResult(w, r, opts.Version, res)
+	h.writeTextResult(conn, method, opts.Version, res, clientIP, path, rawQuery)
 }
 
-func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
-	version := q.Get("v")
+func parseRequestLine(line string) (method, target, proto string, ok bool) {
+	sp1 := strings.IndexByte(line, ' ')
+	if sp1 <= 0 {
+		return "", "", "", false
+	}
+	rest := line[sp1+1:]
+	sp2 := strings.IndexByte(rest, ' ')
+	if sp2 <= 0 {
+		return "", "", "", false
+	}
+	method = line[:sp1]
+	target = rest[:sp2]
+	proto = rest[sp2+1:]
+	if proto != "HTTP/1.1" && proto != "HTTP/1.0" {
+		return "", "", "", false
+	}
+	return method, target, proto, true
+}
+
+func parseStrictQuery(raw string) (map[string]string, bool) {
+	out := make(map[string]string, 6)
+	if raw == "" {
+		return out, true
+	}
+	for raw != "" {
+		var part string
+		if idx := strings.IndexByte(raw, '&'); idx >= 0 {
+			part = raw[:idx]
+			raw = raw[idx+1:]
+		} else {
+			part = raw
+			raw = ""
+		}
+		if part == "" || strings.ContainsRune(part, ';') {
+			return nil, false
+		}
+		rawKey, rawVal, _ := strings.Cut(part, "=")
+		key, ok := percentDecode(rawKey)
+		if !ok {
+			return nil, false
+		}
+		if _, allowed := allowedQueryKeys[key]; !allowed {
+			return nil, false
+		}
+		if _, dup := out[key]; dup {
+			return nil, false
+		}
+		val, ok := percentDecode(rawVal)
+		if !ok {
+			return nil, false
+		}
+		out[key] = val
+	}
+	return out, true
+}
+
+func percentDecode(s string) (string, bool) {
+	if !strings.ContainsAny(s, "%+") {
+		return s, true
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '+':
+			b.WriteByte(' ')
+		case '%':
+			if i+2 >= len(s) {
+				return "", false
+			}
+			hi, ok1 := unhex(s[i+1])
+			lo, ok2 := unhex(s[i+2])
+			if !ok1 || !ok2 {
+				return "", false
+			}
+			b.WriteByte((hi << 4) | lo)
+			i += 2
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String(), true
+}
+
+func unhex(c byte) (byte, bool) {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0', true
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10, true
+	case 'A' <= c && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func parseValidParams(q map[string]string) (ResolveOptions, string, bool) {
+	version := q["v"]
 	switch version {
 	case "", "all":
 		version = "all"
@@ -118,7 +282,7 @@ func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
 		return ResolveOptions{}, "", false
 	}
 
-	format := q.Get("format")
+	format := q["format"]
 	switch format {
 	case "":
 		if version == "4" || version == "6" {
@@ -132,7 +296,7 @@ func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
 	}
 
 	var source SourceMode
-	switch q.Get("source") {
+	switch q["source"] {
 	case "", "auto":
 		source = SourceAuto
 	case "local":
@@ -144,7 +308,7 @@ func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
 	}
 
 	refresh := false
-	switch q.Get("refresh") {
+	switch q["refresh"] {
 	case "", "0", "false":
 		refresh = false
 	case "1", "true":
@@ -153,7 +317,7 @@ func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
 		return ResolveOptions{}, "", false
 	}
 
-	iface := q.Get("iface")
+	iface := q["iface"]
 	if len(iface) > 64 || !isValidIfaceName(iface) {
 		return ResolveOptions{}, "", false
 	}
@@ -168,18 +332,14 @@ func parseValidParams(q url.Values) (ResolveOptions, string, bool) {
 
 func isValidIfaceName(s string) bool {
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c < 0x21 || c > 0x7e {
+		if s[i] < 0x21 || s[i] > 0x7e {
 			return false
 		}
 	}
 	return true
 }
 
-func (h *ServerHandler) writeTextResult(w http.ResponseWriter, r *http.Request, version string, res ResolveOutput) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-
+func (h *ServerHandler) writeTextResult(conn net.Conn, method, version string, res ResolveOutput, clientIP, path, rawQuery string) {
 	switch version {
 	case "4":
 		if res.IPv4 == nil || res.IPv4.IP == "" {
@@ -187,10 +347,10 @@ func (h *ServerHandler) writeTextResult(w http.ResponseWriter, r *http.Request, 
 			if res.IPv4 != nil && res.IPv4.Error != "" {
 				msg = res.IPv4.Error
 			}
-			h.writeRawText(w, r, http.StatusServiceUnavailable, msg)
+			h.writeResponse(conn, method, 503, "Service Unavailable", "text/plain; charset=utf-8", []byte(msg), clientIP, path, rawQuery)
 			return
 		}
-		h.writeRawText(w, r, http.StatusOK, res.IPv4.IP)
+		h.writeResponse(conn, method, 200, "OK", "text/plain; charset=utf-8", []byte(res.IPv4.IP), clientIP, path, rawQuery)
 
 	case "6":
 		if res.IPv6 == nil || res.IPv6.IP == "" {
@@ -198,10 +358,10 @@ func (h *ServerHandler) writeTextResult(w http.ResponseWriter, r *http.Request, 
 			if res.IPv6 != nil && res.IPv6.Error != "" {
 				msg = res.IPv6.Error
 			}
-			h.writeRawText(w, r, http.StatusServiceUnavailable, msg)
+			h.writeResponse(conn, method, 503, "Service Unavailable", "text/plain; charset=utf-8", []byte(msg), clientIP, path, rawQuery)
 			return
 		}
-		h.writeRawText(w, r, http.StatusOK, res.IPv6.IP)
+		h.writeResponse(conn, method, 200, "OK", "text/plain; charset=utf-8", []byte(res.IPv6.IP), clientIP, path, rawQuery)
 
 	default:
 		var lines []string
@@ -212,79 +372,56 @@ func (h *ServerHandler) writeTextResult(w http.ResponseWriter, r *http.Request, 
 			lines = append(lines, "ipv6: "+res.IPv6.IP)
 		}
 		if len(lines) == 0 {
-			h.writeRawText(w, r, http.StatusServiceUnavailable, "no ip address available")
+			h.writeResponse(conn, method, 503, "Service Unavailable", "text/plain; charset=utf-8", []byte("no ip address available"), clientIP, path, rawQuery)
 			return
 		}
-		h.writeRawText(w, r, http.StatusOK, strings.Join(lines, "\n"))
+		h.writeResponse(conn, method, 200, "OK", "text/plain; charset=utf-8", []byte(strings.Join(lines, "\n")), clientIP, path, rawQuery)
 	}
 }
 
-func (h *ServerHandler) writeRawText(w http.ResponseWriter, r *http.Request, status int, body string) {
-	w.WriteHeader(status)
-	if r.Method != http.MethodHead {
-		_, _ = w.Write([]byte(body))
-	}
-	h.logAccess(r, status)
-}
-
-func (h *ServerHandler) writeJSON(w http.ResponseWriter, r *http.Request, status int, v any) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		h.writeError(w, r, "text", http.StatusInternalServerError, "failed to encode response")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	if r.Method != http.MethodHead {
-		_, _ = w.Write(data)
-	}
-	h.logAccess(r, status)
-}
-
-func (h *ServerHandler) writeError(w http.ResponseWriter, r *http.Request, format string, status int, msg string) {
+func (h *ServerHandler) writeError(conn net.Conn, method, format string, status int, reason, msg, clientIP, path, rawQuery string) {
 	if format == "json" {
-		h.writeJSON(w, r, status, map[string]string{"error": msg})
+		var buf bytes.Buffer
+		buf.WriteString(`{"error":`)
+		writeJSONString(&buf, msg)
+		buf.WriteByte('}')
+		h.writeResponse(conn, method, status, reason, "application/json; charset=utf-8", buf.Bytes(), clientIP, path, rawQuery)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	h.writeRawText(w, r, status, msg)
+	h.writeResponse(conn, method, status, reason, "text/plain; charset=utf-8", []byte(msg), clientIP, path, rawQuery)
 }
 
-func (h *ServerHandler) drop(w http.ResponseWriter, r *http.Request, reason string) {
-	if h.logger != nil {
-		h.logger.Printf("444 drop (%s) remote=%s method=%s path=%s query=%s",
-			reason,
-			extractClientIP(r, h.trustProxy),
-			r.Method,
-			r.URL.Path,
-			redactQuery(r.URL.RawQuery),
-		)
+func (h *ServerHandler) writeResponse(conn net.Conn, method string, status int, reason, contentType string, body []byte, clientIP, path, rawQuery string) {
+	var hdr bytes.Buffer
+	hdr.Grow(160 + len(body))
+	hdr.WriteString("HTTP/1.1 ")
+	hdr.WriteString(strconv.Itoa(status))
+	hdr.WriteByte(' ')
+	hdr.WriteString(reason)
+	hdr.WriteString("\r\nContent-Type: ")
+	hdr.WriteString(contentType)
+	hdr.WriteString("\r\nCache-Control: no-store\r\nContent-Length: ")
+	hdr.WriteString(strconv.Itoa(len(body)))
+	hdr.WriteString("\r\nConnection: close\r\n\r\n")
+	if method != "HEAD" {
+		hdr.Write(body)
 	}
-	dropConn(w)
+	_, _ = conn.Write(hdr.Bytes())
+	h.logLine(strconv.Itoa(status) + " remote=" + clientIP + " method=" + method + " path=" + path + " query=" + redactQuery(rawQuery))
 }
 
-func (h *ServerHandler) logAccess(r *http.Request, status int) {
-	if h.logger != nil {
-		h.logger.Printf("%d remote=%s method=%s path=%s query=%s",
-			status,
-			extractClientIP(r, h.trustProxy),
-			r.Method,
-			r.URL.Path,
-			redactQuery(r.URL.RawQuery),
-		)
-	}
+func (h *ServerHandler) logDrop(reason, remote, method, path, rawQuery string) {
+	h.logLine("444 drop (" + reason + ") remote=" + remote + " method=" + method + " path=" + path + " query=" + redactQuery(rawQuery))
 }
 
-// dropConn terminates the underlying TCP connection without sending any HTTP response bytes (Nginx 444 semantics).
-func dropConn(w http.ResponseWriter) {
-	rc := http.NewResponseController(w)
-	if conn, _, err := rc.Hijack(); err == nil {
-		_ = conn.Close()
+func (h *ServerHandler) logLine(msg string) {
+	if h.logOut == nil {
 		return
 	}
-	panic(http.ErrAbortHandler)
+	line := "[ip-api] " + h.now().UTC().Format(time.RFC3339) + " " + msg + "\n"
+	h.logMu.Lock()
+	_, _ = io.WriteString(h.logOut, line)
+	h.logMu.Unlock()
 }
 
 func redactQuery(raw string) string {
@@ -301,23 +438,176 @@ func redactQuery(raw string) string {
 	return strings.Join(parts, "&")
 }
 
-func extractClientIP(r *http.Request, trustProxy bool) string {
+func extractClientIP(remoteAddr, xff, xri string, trustProxy bool) string {
 	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if xff != "" {
 			first := strings.TrimSpace(strings.Split(xff, ",")[0])
 			if addr, err := netip.ParseAddr(first); err == nil {
 				return addr.String()
 			}
 		}
-		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if xri != "" {
 			if addr, err := netip.ParseAddr(xri); err == nil {
 				return addr.String()
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err == nil {
 		return host
 	}
-	return r.RemoteAddr
+	return remoteAddr
+}
+
+// --- Zero-reflection JSON encoder ---
+
+func marshalOverviewJSON(ov OverviewResponse) []byte {
+	var b bytes.Buffer
+	b.Grow(512)
+	b.WriteByte('{')
+	first := true
+
+	addComma := func() {
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+	}
+
+	if ov.IPv4 != nil {
+		addComma()
+		b.WriteString(`"ipv4":`)
+		writeIPResultJSON(&b, ov.IPv4)
+	}
+	if ov.IPv6 != nil {
+		addComma()
+		b.WriteString(`"ipv6":`)
+		writeIPResultJSON(&b, ov.IPv6)
+	}
+	if len(ov.Interfaces) > 0 {
+		addComma()
+		b.WriteString(`"interfaces":[`)
+		for i, iface := range ov.Interfaces {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeInterfaceInfoJSON(&b, iface)
+		}
+		b.WriteByte(']')
+	}
+	if ov.ClientIP != "" {
+		addComma()
+		b.WriteString(`"client_ip":`)
+		writeJSONString(&b, ov.ClientIP)
+	}
+	if ov.Hostname != "" {
+		addComma()
+		b.WriteString(`"hostname":`)
+		writeJSONString(&b, ov.Hostname)
+	}
+	addComma()
+	b.WriteString(`"timestamp":`)
+	writeJSONString(&b, ov.Timestamp)
+
+	b.WriteByte('}')
+	return b.Bytes()
+}
+
+func writeIPResultJSON(b *bytes.Buffer, r *IPResult) {
+	b.WriteByte('{')
+	first := true
+	writeStr := func(k, v string) {
+		if v == "" {
+			return
+		}
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteByte('"')
+		b.WriteString(k)
+		b.WriteString(`":`)
+		writeJSONString(b, v)
+	}
+	writeStr("ip", r.IP)
+	writeStr("source", r.Source)
+	writeStr("iface", r.Iface)
+	writeStr("probe", r.Probe)
+	if r.Cached {
+		if !first {
+			b.WriteByte(',')
+		}
+		first = false
+		b.WriteString(`"cached":true`)
+	}
+	writeStr("error", r.Error)
+	b.WriteByte('}')
+}
+
+func writeInterfaceInfoJSON(b *bytes.Buffer, info InterfaceInfo) {
+	b.WriteString(`{"name":`)
+	writeJSONString(b, info.Name)
+	b.WriteString(`,"up":`)
+	if info.Up {
+		b.WriteString("true")
+	} else {
+		b.WriteString("false")
+	}
+	if info.MAC != "" {
+		b.WriteString(`,"mac":`)
+		writeJSONString(b, info.MAC)
+	}
+	if len(info.IPv4) > 0 {
+		b.WriteString(`,"ipv4":`)
+		writeJSONStringSlice(b, info.IPv4)
+	}
+	if len(info.IPv6) > 0 {
+		b.WriteString(`,"ipv6":`)
+		writeJSONStringSlice(b, info.IPv6)
+	}
+	b.WriteByte('}')
+}
+
+func writeJSONStringSlice(b *bytes.Buffer, items []string) {
+	b.WriteByte('[')
+	for i, s := range items {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		writeJSONString(b, s)
+	}
+	b.WriteByte(']')
+}
+
+func writeJSONString(b *bytes.Buffer, s string) {
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+				const hex = "0123456789abcdef"
+				b.WriteString(`\u00`)
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0x0f])
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
 }

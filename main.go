@@ -3,57 +3,84 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
-	"net/http"
+	"io"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
 
-func main() {
-	logger := log.New(os.Stdout, "[ip-api] ", log.LstdFlags)
+const maxConcurrentConns = 128
 
-	cfg, err := LoadConfig(os.Args[1:], os.Stderr)
+func main() {
+	cfg, err := LoadConfig(os.Args[1:])
 	if err != nil {
-		logger.Fatalf("config error: %v", err)
+		_, _ = io.WriteString(os.Stderr, "[ip-api] config error: "+err.Error()+"\n")
+		os.Exit(1)
 	}
 
 	prober := NewProber(cfg.V4Probes, cfg.V6Probes, cfg.ProbeTimeout, cfg.CacheTTL)
 	resolver := NewResolver(OSInterfaceProvider{}, prober)
-	handler := NewServerHandler(cfg.Token, resolver, cfg.TrustProxy, logger)
+	handler := NewServerHandler(cfg.Token, resolver, cfg.TrustProxy, os.Stdout)
 
-	server := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           handler, // Mounted directly (no ServeMux) so all invalid paths drop with 444.
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		_, _ = io.WriteString(os.Stderr, "[ip-api] listen error: "+err.Error()+"\n")
+		os.Exit(1)
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		logger.Printf("listening on %s (cache_ttl=%s probe_timeout=%s v4_probes=%d v6_probes=%d)",
-			cfg.Listen, cfg.CacheTTL, cfg.ProbeTimeout, len(cfg.V4Probes), len(cfg.V6Probes))
-		errCh <- server.ListenAndServe()
-	}()
+	_, _ = io.WriteString(os.Stdout,
+		"[ip-api] listening on "+ln.Addr().String()+
+			" (go-tiny cache_ttl="+cfg.CacheTTL.String()+
+			" probe_timeout="+cfg.ProbeTimeout.String()+
+			" v4_probes="+strconv.Itoa(len(cfg.V4Probes))+
+			" v6_probes="+strconv.Itoa(len(cfg.V6Probes))+")\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Fatalf("server error: %v", err)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentConns)
+
+	go func() {
+		sig := <-sigCh
+		_, _ = io.WriteString(os.Stdout, "[ip-api] received signal "+sig.String()+", shutting down...\n")
+		cancel()
+		_ = ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
-	case sig := <-sigCh:
-		logger.Printf("received signal %s, shutting down...", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(ctx); err != nil {
-			logger.Fatalf("shutdown error: %v", err)
+
+		select {
+		case sem <- struct{}{}:
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				handler.HandleConn(ctx, c)
+			}(conn)
+		default:
+			// Drop excess connections immediately under load.
+			_ = conn.Close()
 		}
-		logger.Printf("stopped cleanly")
 	}
+
+	wg.Wait()
+	_, _ = io.WriteString(os.Stdout, "[ip-api] stopped cleanly\n")
 }

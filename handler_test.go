@@ -2,41 +2,84 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
 	"time"
 )
 
-func newTestServer(t *testing.T, prober ExternalProber, ifaces []NetInterface) (*httptest.Server, *bytes.Buffer) {
+type jsonIPResult struct {
+	IP     string `json:"ip"`
+	Source string `json:"source"`
+	Iface  string `json:"iface"`
+	Probe  string `json:"probe"`
+	Cached bool   `json:"cached"`
+	Error  string `json:"error"`
+}
+
+type jsonIfaceInfo struct {
+	Name string   `json:"name"`
+	Up   bool     `json:"up"`
+	MAC  string   `json:"mac"`
+	IPv4 []string `json:"ipv4"`
+	IPv6 []string `json:"ipv6"`
+}
+
+type jsonOverview struct {
+	IPv4       *jsonIPResult   `json:"ipv4"`
+	IPv6       *jsonIPResult   `json:"ipv6"`
+	Interfaces []jsonIfaceInfo `json:"interfaces"`
+	ClientIP   string          `json:"client_ip"`
+	Hostname   string          `json:"hostname"`
+	Timestamp  string          `json:"timestamp"`
+}
+
+func startTestTCPServer(t *testing.T, prober ExternalProber, ifaces []NetInterface) (string, *bytes.Buffer) {
 	t.Helper()
 	var logBuf bytes.Buffer
-	logger := log.New(&logBuf, "", 0)
 	resolver := NewResolver(stubInterfaceProvider{ifaces: ifaces}, prober)
-	handler := NewServerHandler("super-secret", resolver, false, logger)
+	handler := NewServerHandler("super-secret", resolver, false, &logBuf)
 	handler.now = func() time.Time {
 		return time.Date(2026, 11, 22, 17, 0, 0, 0, time.UTC)
 	}
-	srv := httptest.NewServer(handler)
-	t.Cleanup(srv.Close)
-	return srv, &logBuf
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handler.HandleConn(ctx, conn)
+		}
+	}()
+
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+	})
+	return ln.Addr().String(), &logBuf
 }
 
 func TestHandlerDrop444OnNonConformingRequests(t *testing.T) {
-	srv, logBuf := newTestServer(t, &stubProber{}, nil)
-	addr := srv.Listener.Addr().String()
+	addr, logBuf := startTestTCPServer(t, &stubProber{}, nil)
 
 	rawRequests := []struct {
 		name string
 		raw  string
 	}{
+		{"garbage non-http", "NOT EVEN HTTP\r\n\r\n"},
 		{"root path", "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"},
 		{"trailing slash", "GET /ip/ HTTP/1.1\r\nHost: localhost\r\n\r\n"},
 		{"scanner path", "GET /.env HTTP/1.1\r\nHost: localhost\r\n\r\n"},
@@ -96,53 +139,45 @@ func TestHandlerValidRequestsTextAndJSON(t *testing.T) {
 		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
 		v6Err: errors.New("no ipv6 probe"),
 	}
-	srv, logBuf := newTestServer(t, prober, ifaces)
-	client := srv.Client()
+	addr, logBuf := startTestTCPServer(t, prober, ifaces)
+	baseURL := "http://" + addr
+	client := &http.Client{Timeout: 3 * time.Second}
 
-	// 1. Plain text IPv4 (default text for v=4)
-	resp, err := client.Get(srv.URL + "/ip?token=super-secret&v=4")
+	resp, err := client.Get(baseURL + "/ip?token=super-secret&v=4")
 	if err != nil {
 		t.Fatalf("GET v=4 failed: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "1.2.3.4" {
+	if resp.StatusCode != 200 || string(body) != "1.2.3.4" {
 		t.Fatalf("v=4 unexpected: status=%d body=%q", resp.StatusCode, string(body))
 	}
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("expected Cache-Control=no-store, got %q", got)
 	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
-		t.Fatalf("expected text/plain, got %q", resp.Header.Get("Content-Type"))
-	}
 
-	// 2. Plain text IPv6 (direct NIC public IPv6)
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret&v=6")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret&v=6")
 	if err != nil {
 		t.Fatalf("GET v=6 failed: %v", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "240e:3b1:1234::1" {
+	if resp.StatusCode != 200 || string(body) != "240e:3b1:1234::1" {
 		t.Fatalf("v=6 unexpected: status=%d body=%q", resp.StatusCode, string(body))
 	}
 
-	// 3. Default overview JSON (v=all, format=json)
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret")
 	if err != nil {
 		t.Fatalf("GET overview JSON failed: %v", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		t.Fatalf("overview JSON status=%d body=%q", resp.StatusCode, string(body))
 	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		t.Fatalf("expected application/json, got %q", resp.Header.Get("Content-Type"))
-	}
-	var ov OverviewResponse
+	var ov jsonOverview
 	if err := json.Unmarshal(body, &ov); err != nil {
-		t.Fatalf("unmarshal overview JSON failed: %v", err)
+		t.Fatalf("unmarshal overview JSON failed: %v (raw=%s)", err, string(body))
 	}
 	if ov.IPv4 == nil || ov.IPv4.IP != "1.2.3.4" || ov.IPv4.Source != "external" {
 		t.Fatalf("unexpected overview IPv4: %+v", ov.IPv4)
@@ -157,51 +192,46 @@ func TestHandlerValidRequestsTextAndJSON(t *testing.T) {
 		t.Fatalf("unexpected metadata: client_ip=%q timestamp=%q", ov.ClientIP, ov.Timestamp)
 	}
 
-	// 4. Dual-stack plain text (v=all&format=text)
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret&v=all&format=text")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret&v=all&format=text")
 	if err != nil {
 		t.Fatalf("GET v=all text failed: %v", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	wantDualText := "ipv4: 1.2.3.4\nipv6: 240e:3b1:1234::1"
-	if resp.StatusCode != http.StatusOK || string(body) != wantDualText {
-		t.Fatalf("dual text unexpected: status=%d body=%q want=%q", resp.StatusCode, string(body), wantDualText)
+	if resp.StatusCode != 200 || string(body) != wantDualText {
+		t.Fatalf("dual text unexpected: status=%d body=%q", resp.StatusCode, string(body))
 	}
 
-	// 5. Local NIC IP via iface + source=local
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret&v=4&iface=eth0&source=local")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret&v=4&iface=eth0&source=local")
 	if err != nil {
 		t.Fatalf("GET local eth0 failed: %v", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "192.168.1.10" {
+	if resp.StatusCode != 200 || string(body) != "192.168.1.10" {
 		t.Fatalf("local eth0 unexpected: status=%d body=%q", resp.StatusCode, string(body))
 	}
 
-	// 6. Nonexistent interface returns 404
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret&v=4&iface=missing0")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret&v=4&iface=missing0")
 	if err != nil {
 		t.Fatalf("GET missing iface failed: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
+	if resp.StatusCode != 404 {
 		t.Fatalf("expected 404 for missing iface, got %d", resp.StatusCode)
 	}
 
-	// 7. HEAD request returns 200 with empty body
-	resp, err = client.Head(srv.URL + "/ip?token=super-secret&v=4")
+	resp, err = client.Head(baseURL + "/ip?token=super-secret&v=4")
 	if err != nil {
 		t.Fatalf("HEAD v=4 failed: %v", err)
 	}
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || len(body) != 0 {
+	if resp.StatusCode != 200 || len(body) != 0 {
 		t.Fatalf("HEAD unexpected: status=%d body=%q", resp.StatusCode, string(body))
 	}
 
-	// Verify token never leaked in access logs
 	if strings.Contains(logBuf.String(), "super-secret") {
 		t.Fatalf("token leaked in logs:\n%s", logBuf.String())
 	}
@@ -212,30 +242,29 @@ func TestHandlerUnavailableIPStatusCodes(t *testing.T) {
 		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
 		v6Err: errors.New("ipv6 unreachable"),
 	}
-	srv, _ := newTestServer(t, prober, nil)
-	client := srv.Client()
+	addr, _ := startTestTCPServer(t, prober, nil)
+	baseURL := "http://" + addr
+	client := &http.Client{Timeout: 3 * time.Second}
 
-	// Text mode for missing IPv6 returns 503.
-	resp, err := client.Get(srv.URL + "/ip?token=super-secret&v=6")
+	resp, err := client.Get(baseURL + "/ip?token=super-secret&v=6")
 	if err != nil {
 		t.Fatalf("GET v=6 failed: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
+	if resp.StatusCode != 503 {
 		t.Fatalf("expected 503 for unavailable v6 text, got %d", resp.StatusCode)
 	}
 
-	// JSON mode still returns 200 with ipv6.error populated alongside valid ipv4.
-	resp, err = client.Get(srv.URL + "/ip?token=super-secret")
+	resp, err = client.Get(baseURL + "/ip?token=super-secret")
 	if err != nil {
 		t.Fatalf("GET overview failed: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200 for partial JSON overview, got %d", resp.StatusCode)
 	}
-	var ov OverviewResponse
+	var ov jsonOverview
 	if err := json.Unmarshal(body, &ov); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}

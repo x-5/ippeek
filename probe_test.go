@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -49,6 +48,33 @@ func TestProberFallbackAndValidation(t *testing.T) {
 	}
 }
 
+func TestProberChunkedAndRedirect(t *testing.T) {
+	srvTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Force chunked transfer encoding by flushing before finishing.
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("8.8."))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("8.8\n"))
+	}))
+	defer srvTarget.Close()
+
+	srvRedirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvTarget.URL, http.StatusFound)
+	}))
+	defer srvRedirect.Close()
+
+	prober := NewProber([]string{srvRedirect.URL}, nil, 2*time.Second, 30*time.Second)
+	res, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil {
+		t.Fatalf("Probe chunked/redirect failed: %v", err)
+	}
+	if res.IP != "8.8.8.8" {
+		t.Fatalf("expected 8.8.8.8, got %+v", res)
+	}
+}
+
 func TestProberCacheTTLAndRefresh(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,13 +91,11 @@ func TestProberCacheTTLAndRefresh(t *testing.T) {
 	prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 60*time.Second)
 	prober.now = func() time.Time { return curTime }
 
-	// First call populates cache.
 	r1, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
 	if err != nil || r1.IP != "1.2.3.4" || r1.Cached {
 		t.Fatalf("first probe unexpected: res=%+v err=%v", r1, err)
 	}
 
-	// Second call hits cache without calling server.
 	r2, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
 	if err != nil || r2.IP != "1.2.3.4" || !r2.Cached {
 		t.Fatalf("cached probe unexpected: res=%+v err=%v", r2, err)
@@ -80,7 +104,6 @@ func TestProberCacheTTLAndRefresh(t *testing.T) {
 		t.Fatalf("expected 1 hit after cache hit, got %d", hits.Load())
 	}
 
-	// Forced refresh bypasses cache and updates it.
 	r3, err := prober.Probe(context.Background(), FamilyV4, "", nil, true)
 	if err != nil || r3.IP != "5.6.7.8" || r3.Cached {
 		t.Fatalf("refresh probe unexpected: res=%+v err=%v", r3, err)
@@ -89,7 +112,6 @@ func TestProberCacheTTLAndRefresh(t *testing.T) {
 		t.Fatalf("expected 2 hits after refresh, got %d", hits.Load())
 	}
 
-	// Advancing clock past TTL expires cache.
 	curTime = curTime.Add(61 * time.Second)
 	r4, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
 	if err != nil || r4.IP != "5.6.7.8" || r4.Cached {
@@ -141,17 +163,14 @@ func TestProberInflightCoalescing(t *testing.T) {
 
 func TestLoadConfig(t *testing.T) {
 	t.Setenv("IP_API_TOKEN", "")
-	var stderr bytes.Buffer
 
-	// Missing token must fail.
-	if _, err := LoadConfig([]string{}, &stderr); err == nil {
+	if _, err := LoadConfig([]string{}); err == nil {
 		t.Fatal("expected error when token is missing")
 	}
 
-	// Env var sets token and defaults.
 	t.Setenv("IP_API_TOKEN", "env-secret")
 	t.Setenv("IP_API_LISTEN", ":9090")
-	cfg, err := LoadConfig([]string{}, &stderr)
+	cfg, err := LoadConfig([]string{})
 	if err != nil {
 		t.Fatalf("LoadConfig with env failed: %v", err)
 	}
@@ -159,12 +178,11 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatalf("unexpected env config: %+v", cfg)
 	}
 
-	// CLI flag overrides env var.
-	cfg, err = LoadConfig([]string{"-token", "cli-secret", "-listen", "127.0.0.1:7070", "-cache-ttl", "15s"}, &stderr)
+	cfg, err = LoadConfig([]string{"-token", "cli-secret", "--listen=127.0.0.1:7070", "-cache-ttl", "15s", "-trust-proxy"})
 	if err != nil {
 		t.Fatalf("LoadConfig with flags failed: %v", err)
 	}
-	if cfg.Token != "cli-secret" || cfg.Listen != "127.0.0.1:7070" || cfg.CacheTTL != 15*time.Second {
+	if cfg.Token != "cli-secret" || cfg.Listen != "127.0.0.1:7070" || cfg.CacheTTL != 15*time.Second || !cfg.TrustProxy {
 		t.Fatalf("unexpected CLI config: %+v", cfg)
 	}
 }

@@ -2,9 +2,6 @@ package main
 
 import (
 	"errors"
-	"flag"
-	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -19,7 +16,7 @@ const (
 	defaultV6Probes     = "http://6.ipw.cn,http://api6.ipify.org,http://ipv6.icanhazip.com"
 )
 
-// Config holds runtime configuration for the IP API server.
+// Config holds runtime configuration for the ultra-slim IP API server.
 type Config struct {
 	Listen       string
 	Token        string
@@ -30,53 +27,107 @@ type Config struct {
 	TrustProxy   bool
 }
 
-// LoadConfig parses configuration from environment variables and CLI flags (CLI takes precedence).
-func LoadConfig(args []string, stderr io.Writer) (Config, error) {
-	fs := flag.NewFlagSet("ip-api", flag.ContinueOnError)
-	if stderr != nil {
-		fs.SetOutput(stderr)
-	}
-
-	envListen := envOrDefault("IP_API_LISTEN", defaultListen)
-	envToken := os.Getenv("IP_API_TOKEN")
-	envV4 := envOrDefault("IP_API_V4_PROBES", defaultV4Probes)
-	envV6 := envOrDefault("IP_API_V6_PROBES", defaultV6Probes)
-
-	envCacheTTL, err := envDurationOrDefault("IP_API_CACHE_TTL", defaultCacheTTL)
-	if err != nil {
-		return Config{}, err
-	}
-	envProbeTimeout, err := envDurationOrDefault("IP_API_PROBE_TIMEOUT", defaultProbeTimeout)
-	if err != nil {
-		return Config{}, err
-	}
-	envTrustProxy, err := envBoolOrDefault("IP_API_TRUST_PROXY", false)
-	if err != nil {
-		return Config{}, err
-	}
-
-	var (
-		listen       = fs.String("listen", envListen, "HTTP listen address (env: IP_API_LISTEN)")
-		token        = fs.String("token", envToken, "Required authentication token (env: IP_API_TOKEN)")
-		cacheTTL     = fs.Duration("cache-ttl", envCacheTTL, "Public IP probe cache TTL, 0 disables cache (env: IP_API_CACHE_TTL)")
-		probeTimeout = fs.Duration("probe-timeout", envProbeTimeout, "Timeout per external IP probe (env: IP_API_PROBE_TIMEOUT)")
-		v4ProbesRaw  = fs.String("v4-probes", envV4, "Comma-separated IPv4 probe URLs (env: IP_API_V4_PROBES)")
-		v6ProbesRaw  = fs.String("v6-probes", envV6, "Comma-separated IPv6 probe URLs (env: IP_API_V6_PROBES)")
-		trustProxy   = fs.Bool("trust-proxy", envTrustProxy, "Trust X-Forwarded-For / X-Real-IP headers for client_ip (env: IP_API_TRUST_PROXY)")
-	)
-
-	if err := fs.Parse(args); err != nil {
-		return Config{}, err
-	}
-
+// LoadConfig parses configuration from environment variables and CLI arguments without flag/fmt/reflect.
+func LoadConfig(args []string) (Config, error) {
 	cfg := Config{
-		Listen:       strings.TrimSpace(*listen),
-		Token:        strings.TrimSpace(*token),
-		CacheTTL:     *cacheTTL,
-		ProbeTimeout: *probeTimeout,
-		V4Probes:     splitCSV(*v4ProbesRaw),
-		V6Probes:     splitCSV(*v6ProbesRaw),
-		TrustProxy:   *trustProxy,
+		Listen:       envOrDefault("IP_API_LISTEN", defaultListen),
+		Token:        strings.TrimSpace(os.Getenv("IP_API_TOKEN")),
+		CacheTTL:     defaultCacheTTL,
+		ProbeTimeout: defaultProbeTimeout,
+		V4Probes:     splitCSV(envOrDefault("IP_API_V4_PROBES", defaultV4Probes)),
+		V6Probes:     splitCSV(envOrDefault("IP_API_V6_PROBES", defaultV6Probes)),
+	}
+
+	var err error
+	if cfg.CacheTTL, err = envDurationOrDefault("IP_API_CACHE_TTL", defaultCacheTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.ProbeTimeout, err = envDurationOrDefault("IP_API_PROBE_TIMEOUT", defaultProbeTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.TrustProxy, err = envBoolOrDefault("IP_API_TRUST_PROXY", false); err != nil {
+		return Config{}, err
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			return Config{}, errors.New("unexpected positional argument: " + arg)
+		}
+		trimmed := strings.TrimLeft(arg, "-")
+		name, val, hasEq := strings.Cut(trimmed, "=")
+
+		nextVal := func() (string, error) {
+			if hasEq {
+				return val, nil
+			}
+			if i+1 >= len(args) {
+				return "", errors.New("missing value for flag -" + name)
+			}
+			i++
+			return args[i], nil
+		}
+
+		switch name {
+		case "h", "help":
+			return Config{}, errors.New("usage: ip-api -token SECRET [-listen :8080] [-cache-ttl 60s] [-probe-timeout 3s] [-v4-probes ...] [-v6-probes ...] [-trust-proxy]")
+		case "listen":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.Listen = strings.TrimSpace(v)
+		case "token":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.Token = strings.TrimSpace(v)
+		case "cache-ttl":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			d, err := time.ParseDuration(strings.TrimSpace(v))
+			if err != nil {
+				return Config{}, errors.New("invalid -cache-ttl: " + err.Error())
+			}
+			cfg.CacheTTL = d
+		case "probe-timeout":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			d, err := time.ParseDuration(strings.TrimSpace(v))
+			if err != nil {
+				return Config{}, errors.New("invalid -probe-timeout: " + err.Error())
+			}
+			cfg.ProbeTimeout = d
+		case "v4-probes":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.V4Probes = splitCSV(v)
+		case "v6-probes":
+			v, err := nextVal()
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.V6Probes = splitCSV(v)
+		case "trust-proxy":
+			if hasEq {
+				b, err := strconv.ParseBool(strings.TrimSpace(val))
+				if err != nil {
+					return Config{}, errors.New("invalid -trust-proxy: " + err.Error())
+				}
+				cfg.TrustProxy = b
+			} else {
+				cfg.TrustProxy = true
+			}
+		default:
+			return Config{}, errors.New("unknown flag: -" + name)
+		}
 	}
 
 	if cfg.Listen == "" {
@@ -91,7 +142,6 @@ func LoadConfig(args []string, stderr io.Writer) (Config, error) {
 	if cfg.ProbeTimeout <= 0 {
 		return Config{}, errors.New("probe-timeout must be > 0")
 	}
-
 	return cfg, nil
 }
 
@@ -109,7 +159,7 @@ func envDurationOrDefault(key string, def time.Duration) (time.Duration, error) 
 	}
 	d, err := time.ParseDuration(strings.TrimSpace(v))
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s=%q: %w", key, v, err)
+		return 0, errors.New("invalid " + key + ": " + err.Error())
 	}
 	return d, nil
 }
@@ -121,7 +171,7 @@ func envBoolOrDefault(key string, def bool) (bool, error) {
 	}
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	if err != nil {
-		return false, fmt.Errorf("invalid %s=%q: %w", key, v, err)
+		return false, errors.New("invalid " + key + ": " + err.Error())
 	}
 	return b, nil
 }
