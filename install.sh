@@ -24,6 +24,7 @@ PROBE_TIMEOUT="3s"
 V4_PROBES=""
 V6_PROBES=""
 TRUST_PROXY=""
+QUIET_DROPS=""
 LOCAL_BIN=""
 MIRROR=""
 KEEP_CONFIG="false"
@@ -52,17 +53,19 @@ Options:
   --mirror <url-prefix>          Optional download proxy prefix (e.g. https://ghfast.top/)
   --local-bin <path>             Install/update from a local binary instead of downloading
   --listen <addr>                Listen address (default: :8080)
-  --token <secret>               API token (auto-generated on install if omitted)
+  --token <secret>               API token(s), comma-separated for rotation (auto-generated if omitted)
   --cache-ttl <duration>         External probe cache TTL (default: 60s)
   --probe-timeout <duration>     External probe timeout (default: 3s)
   --v4-probes <csv>              Custom IPv4 probe URLs (comma-separated)
   --v6-probes <csv>              Custom IPv6 probe URLs (comma-separated)
   --trust-proxy                  Trust X-Forwarded-For / X-Real-IP headers
+  --quiet-drops                  Suppress 444 connection-drop log lines
   --keep-config                  Preserve /etc/ippeek during uninstall
   -h, --help                     Show this help
 
 Examples:
   sudo bash install.sh install --token my-secret --listen :8080
+  sudo bash install.sh install --token "new-secret,old-secret" --quiet-drops
   sudo bash install.sh install --variant std --token my-secret
   sudo bash install.sh update
   sudo bash install.sh check
@@ -228,6 +231,7 @@ write_config_files() {
 		[ -n "${V4_PROBES}" ]   && echo "IPPEEK_V4_PROBES=${V4_PROBES}"
 		[ -n "${V6_PROBES}" ]   && echo "IPPEEK_V6_PROBES=${V6_PROBES}"
 		[ -n "${TRUST_PROXY}" ] && echo "IPPEEK_TRUST_PROXY=${TRUST_PROXY}"
+		[ -n "${QUIET_DROPS}" ] && echo "IPPEEK_QUIET_DROPS=${QUIET_DROPS}"
 	} > "${ENV_FILE}"
 	chown root:"${SVC_USER}" "${ENV_FILE}"
 	chmod 0640 "${ENV_FILE}"
@@ -396,15 +400,20 @@ cmd_check() {
 
 	echo "=== ${APP_NAME} Status ==="
 	if [ -x "${BIN_PATH}" ]; then
-		ok "Binary  : ${BIN_PATH} ($(du -h "${BIN_PATH}" | awk '{print $1}'))"
+		local bin_ver
+		bin_ver="$("${BIN_PATH}" -version 2>/dev/null || true)"
+		ok "Binary  : ${BIN_PATH} ($(du -h "${BIN_PATH}" | awk '{print $1}'))${bin_ver:+ (${bin_ver})}"
 	else
 		err "Binary  : missing (${BIN_PATH})"
 	fi
 
 	if [ -f "${META_FILE}" ]; then
-		# shellcheck disable=SC1090
-		. "${META_FILE}"
-		info "Metadata: version=${VERSION:-?} variant=${VARIANT:-?} arch=${ARCH:-?} repo=${REPO:-?}"
+		local meta_version meta_variant meta_arch meta_repo
+		meta_version="$(read_kv "${META_FILE}" VERSION)"
+		meta_variant="$(read_kv "${META_FILE}" VARIANT)"
+		meta_arch="$(read_kv "${META_FILE}" ARCH)"
+		meta_repo="$(read_kv "${META_FILE}" REPO)"
+		info "Metadata: version=${meta_version:-?} variant=${meta_variant:-?} arch=${meta_arch:-?} repo=${meta_repo:-?}"
 	fi
 
 	local active enabled
@@ -417,9 +426,11 @@ cmd_check() {
 	fi
 
 	if [ -r "${ENV_FILE}" ] && command -v curl >/dev/null 2>&1 && [ "${active}" = "active" ]; then
-		local env_listen env_token base_url
-		env_listen="$(sed -n 's/^IPPEEK_LISTEN=//p' "${ENV_FILE}" | head -n 1)"
-		env_token="$(sed -n 's/^IPPEEK_TOKEN=//p' "${ENV_FILE}" | head -n 1)"
+		local env_listen env_token check_token escaped_token base_url
+		env_listen="$(read_kv "${ENV_FILE}" IPPEEK_LISTEN)"
+		env_token="$(read_kv "${ENV_FILE}" IPPEEK_TOKEN)"
+		# Support comma-separated multi-token configs by picking the first non-empty token.
+		check_token="$(printf '%s\n' "${env_token}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF {print; exit}')"
 		base_url="$(listen_to_loopback_url "${env_listen:-:8080}")"
 
 		# 1. Verify 444 connection-level drop (curl exit code 52 = Empty reply from server)
@@ -431,16 +442,22 @@ cmd_check() {
 			warn "444 Drop: unexpected curl exit=${rc} for GET ${base_url}/"
 		fi
 
-		# 2. Verify authenticated loopback query without printing the token
-		local resp
-		if resp="$(curl -fsS --max-time 3 "${base_url}/ip?token=${env_token}&v=4&iface=lo&source=local" 2>/dev/null)"; then
-			if [ "${resp}" = "127.0.0.1" ]; then
-				ok "API Auth: PASS (GET /ip?iface=lo&source=local -> 127.0.0.1)"
-			else
-				warn "API Auth: unexpected body '${resp}'"
-			fi
+		# 2. Verify authenticated loopback query via curl -K - stdin so token never appears in /proc/<pid>/cmdline
+		if [ -z "${check_token}" ]; then
+			err "API Auth: IPPEEK_TOKEN is empty in ${ENV_FILE}"
 		else
-			err "API Auth: FAILED to query ${base_url}/ip"
+			escaped_token="${check_token//\\/\\\\}"
+			escaped_token="${escaped_token//\"/\\\"}"
+			local resp
+			if resp="$(printf 'url = "%s/ip?token=%s&v=4&iface=lo&source=local"\n' "${base_url}" "${escaped_token}" | curl -fsSg --max-time 3 -K - 2>/dev/null)"; then
+				if [ "${resp}" = "127.0.0.1" ]; then
+					ok "API Auth: PASS (GET /ip?iface=lo&source=local -> 127.0.0.1)"
+				else
+					warn "API Auth: unexpected body '${resp}'"
+				fi
+			else
+				err "API Auth: FAILED to query ${base_url}/ip"
+			fi
 		fi
 	elif [ ! -r "${ENV_FILE}" ]; then
 		warn "Run with sudo to perform authenticated loopback self-check."
@@ -503,18 +520,19 @@ main() {
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
-			--variant)       VARIANT="${2:-}"; shift 2 ;;
-			--version)       VERSION="${2:-}"; shift 2 ;;
-			--repo)          REPO="${2:-}"; REPO_SET="true"; shift 2 ;;
-			--mirror)        MIRROR="${2:-}"; shift 2 ;;
-			--local-bin)     LOCAL_BIN="${2:-}"; shift 2 ;;
-			--listen)        LISTEN="${2:-}"; shift 2 ;;
-			--token)         TOKEN="${2:-}"; shift 2 ;;
-			--cache-ttl)     CACHE_TTL="${2:-}"; shift 2 ;;
-			--probe-timeout) PROBE_TIMEOUT="${2:-}"; shift 2 ;;
-			--v4-probes)     V4_PROBES="${2:-}"; shift 2 ;;
-			--v6-probes)     V6_PROBES="${2:-}"; shift 2 ;;
+			--variant)       [ $# -ge 2 ] || die "Option $1 requires a value"; VARIANT="$2"; shift 2 ;;
+			--version)       [ $# -ge 2 ] || die "Option $1 requires a value"; VERSION="$2"; shift 2 ;;
+			--repo)          [ $# -ge 2 ] || die "Option $1 requires a value"; REPO="$2"; REPO_SET="true"; shift 2 ;;
+			--mirror)        [ $# -ge 2 ] || die "Option $1 requires a value"; MIRROR="$2"; shift 2 ;;
+			--local-bin)     [ $# -ge 2 ] || die "Option $1 requires a value"; LOCAL_BIN="$2"; shift 2 ;;
+			--listen)        [ $# -ge 2 ] || die "Option $1 requires a value"; LISTEN="$2"; shift 2 ;;
+			--token)         [ $# -ge 2 ] || die "Option $1 requires a value"; TOKEN="$2"; shift 2 ;;
+			--cache-ttl)     [ $# -ge 2 ] || die "Option $1 requires a value"; CACHE_TTL="$2"; shift 2 ;;
+			--probe-timeout) [ $# -ge 2 ] || die "Option $1 requires a value"; PROBE_TIMEOUT="$2"; shift 2 ;;
+			--v4-probes)     [ $# -ge 2 ] || die "Option $1 requires a value"; V4_PROBES="$2"; shift 2 ;;
+			--v6-probes)     [ $# -ge 2 ] || die "Option $1 requires a value"; V6_PROBES="$2"; shift 2 ;;
 			--trust-proxy)   TRUST_PROXY="true"; shift ;;
+			--quiet-drops)   QUIET_DROPS="true"; shift ;;
 			--keep-config)   KEEP_CONFIG="true"; shift ;;
 			-h|--help)       usage; exit 0 ;;
 			*) die "Unknown option: $1" ;;
