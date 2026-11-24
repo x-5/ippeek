@@ -1,0 +1,10 @@
+.git
+.github
+dist
+release-assets
+*.md
+*.sh
+Makefile
+Dockerfile
+.dockerignore
+.gitignore

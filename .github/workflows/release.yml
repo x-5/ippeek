@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout std (master)
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: src-std
+
+      - name: Checkout tiny (go-tiny)
+        uses: actions/checkout@v4
+        with:
+          ref: go-tiny
+          path: src-tiny
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Test both editions
+        run: |
+          (cd src-std  && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
+          (cd src-tiny && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
+
+      - name: Build std, tiny, and tiny-upx binaries
+        run: |
+          set -e
+          mkdir -p release-assets
+          build_matrix() {
+            local src_dir="$1" prefix="$2"
+            (
+              cd "${src_dir}"
+              CGO_ENABLED=0 GOOS=linux   GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-amd64" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=arm64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-arm64" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=7          go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-armv7" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=6          go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-armv6" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=mipsle  GOMIPS=softfloat go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-mipsle-softfloat" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=mips    GOMIPS=softfloat go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-mips-softfloat" .
+              CGO_ENABLED=0 GOOS=linux   GOARCH=riscv64                  go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-riscv64" .
+              CGO_ENABLED=0 GOOS=windows GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-windows-amd64.exe" .
+              CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-darwin-arm64" .
+              CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-darwin-amd64" .
+            )
+          }
+
+          build_matrix src-std  ip-api-std
+          build_matrix src-tiny ip-api-tiny
+
+          for arch in linux-amd64 linux-arm64 linux-armv7 linux-armv6 linux-mipsle-softfloat linux-mips-softfloat windows-amd64.exe; do
+            cp "release-assets/ip-api-tiny-${arch}" "release-assets/ip-api-tiny-upx-${arch}"
+            upx --best --lzma -q "release-assets/ip-api-tiny-upx-${arch}"
+          done
+
+          (cd release-assets && sha256sum ip-api-* > checksums.txt)
+          ls -lh release-assets/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "${TAG}" release-assets/* \
+            --title "${TAG}" \
+            --generate-notes
