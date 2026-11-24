@@ -234,7 +234,7 @@ func probeOne(ctx context.Context, client *http.Client, family IPFamily, probeUR
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "ip-api/1.0")
+	req.Header.Set("User-Agent", "ippeek/1.0")
 	req.Header.Set("Accept", "text/plain")
 
 	resp, err := client.Do(req)

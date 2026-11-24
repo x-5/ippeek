@@ -1,5 +1,5 @@
 GO_IMAGE ?= golang:1.23-alpine
-APP_NAME ?= ip-api
+APP_NAME ?= ippeek
 DIST_DIR ?= dist
 LDFLAGS  := -s -w
 

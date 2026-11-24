@@ -1,4 +1,4 @@
-# ip-api
+# ippeek
 
 超精简、零第三方依赖的 Go IP 查询 API 服务器，支持指定网卡、公网 IPv4/IPv6 智能获取、纯文本/JSON 双格式以及全不合规请求 **444 连接级 0 字节丢弃**。
 
@@ -34,13 +34,13 @@ Client ──GET /ip?token=...──▶ 严格校验 (路径/方法/白名单/�
 
 ```bash
 # 一键部署（默认安装 tiny-upx，未传 --token 时自动生成随机密钥）
-curl -fsSL https://raw.githubusercontent.com/x-5/ip-api/master/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/x-5/ippeek/master/install.sh | \
   sudo bash -s -- install --token YOUR_SECRET --listen :8080
 
 # 指定版本部署（tiny-upx / tiny / std）
 sudo bash install.sh install --variant std --token YOUR_SECRET
 
-# 一键更新（保留 /etc/ip-api/ip-api.env 配置）
+# 一键更新（保留 /etc/ippeek/ippeek.env 配置）
 sudo bash install.sh update
 
 # 一键检查（服务状态 + 444 断连与鉴权回环自检 + 日志）
@@ -52,21 +52,21 @@ sudo bash install.sh uninstall
 
 ### 2. 直接运行 / 环境变量
 
-CLI 参数优先于环境变量（`-token` / `IP_API_TOKEN` 为必填）：
+CLI 参数优先于环境变量（`-token` / `IPPEEK_TOKEN` 为必填）：
 
 ```bash
-IP_API_TOKEN=YOUR_SECRET ./ip-api -listen :8080
+IPPEEK_TOKEN=YOUR_SECRET ./ippeek -listen :8080
 ```
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `-listen` | `IP_API_LISTEN` | `:8080` | 监听地址 |
-| `-token` | `IP_API_TOKEN` | **必填** | 鉴权 Token |
-| `-cache-ttl` | `IP_API_CACHE_TTL` | `60s` | 外部探测缓存 TTL（`0` 禁用） |
-| `-probe-timeout` | `IP_API_PROBE_TIMEOUT` | `3s` | 单次探测超时 |
-| `-v4-probes` | `IP_API_V4_PROBES` | `4.ipw.cn,ip.3322.net,api4.ipify.org,ipv4.icanhazip.com` | IPv4 探测源 |
-| `-v6-probes` | `IP_API_V6_PROBES` | `6.ipw.cn,api6.ipify.org,ipv6.icanhazip.com` | IPv6 探测源 |
-| `-trust-proxy` | `IP_API_TRUST_PROXY` | `false` | 信任反代头提取 `client_ip` |
+| `-listen` | `IPPEEK_LISTEN` | `:8080` | 监听地址 |
+| `-token` | `IPPEEK_TOKEN` | **必填** | 鉴权 Token |
+| `-cache-ttl` | `IPPEEK_CACHE_TTL` | `60s` | 外部探测缓存 TTL（`0` 禁用） |
+| `-probe-timeout` | `IPPEEK_PROBE_TIMEOUT` | `3s` | 单次探测超时 |
+| `-v4-probes` | `IPPEEK_V4_PROBES` | `4.ipw.cn,ip.3322.net,api4.ipify.org,ipv4.icanhazip.com` | IPv4 探测源 |
+| `-v6-probes` | `IPPEEK_V6_PROBES` | `6.ipw.cn,api6.ipify.org,ipv6.icanhazip.com` | IPv6 探测源 |
+| `-trust-proxy` | `IPPEEK_TRUST_PROXY` | `false` | 信任反代头提取 `client_ip` |
 
 ### 3. API 调用（唯一入口 `GET /ip`）
 

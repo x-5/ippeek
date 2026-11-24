@@ -10,11 +10,11 @@ WORKDIR /src
 COPY go.mod *.go ./
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETARM} \
-    go build -trimpath -ldflags="-s -w" -o /out/ip-api .
+    go build -trimpath -ldflags="-s -w" -o /out/ippeek .
 
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=builder /out/ip-api /ip-api
+COPY --from=builder /out/ippeek /ippeek
 
 EXPOSE 8080
-ENTRYPOINT ["/ip-api"]
+ENTRYPOINT ["/ippeek"]

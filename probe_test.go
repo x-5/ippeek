@@ -140,7 +140,7 @@ func TestProberInflightCoalescing(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	t.Setenv("IP_API_TOKEN", "")
+	t.Setenv("IPPEEK_TOKEN", "")
 	var stderr bytes.Buffer
 
 	// Missing token must fail.
@@ -149,8 +149,8 @@ func TestLoadConfig(t *testing.T) {
 	}
 
 	// Env var sets token and defaults.
-	t.Setenv("IP_API_TOKEN", "env-secret")
-	t.Setenv("IP_API_LISTEN", ":9090")
+	t.Setenv("IPPEEK_TOKEN", "env-secret")
+	t.Setenv("IPPEEK_LISTEN", ":9090")
 	cfg, err := LoadConfig([]string{}, &stderr)
 	if err != nil {
 		t.Fatalf("LoadConfig with env failed: %v", err)

@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	logger := log.New(os.Stdout, "[ip-api] ", log.LstdFlags)
+	logger := log.New(os.Stdout, "[ippeek] ", log.LstdFlags)
 
 	cfg, err := LoadConfig(os.Args[1:], os.Stderr)
 	if err != nil {

@@ -32,37 +32,37 @@ type Config struct {
 
 // LoadConfig parses configuration from environment variables and CLI flags (CLI takes precedence).
 func LoadConfig(args []string, stderr io.Writer) (Config, error) {
-	fs := flag.NewFlagSet("ip-api", flag.ContinueOnError)
+	fs := flag.NewFlagSet("ippeek", flag.ContinueOnError)
 	if stderr != nil {
 		fs.SetOutput(stderr)
 	}
 
-	envListen := envOrDefault("IP_API_LISTEN", defaultListen)
-	envToken := os.Getenv("IP_API_TOKEN")
-	envV4 := envOrDefault("IP_API_V4_PROBES", defaultV4Probes)
-	envV6 := envOrDefault("IP_API_V6_PROBES", defaultV6Probes)
+	envListen := envOrDefault("IPPEEK_LISTEN", defaultListen)
+	envToken := os.Getenv("IPPEEK_TOKEN")
+	envV4 := envOrDefault("IPPEEK_V4_PROBES", defaultV4Probes)
+	envV6 := envOrDefault("IPPEEK_V6_PROBES", defaultV6Probes)
 
-	envCacheTTL, err := envDurationOrDefault("IP_API_CACHE_TTL", defaultCacheTTL)
+	envCacheTTL, err := envDurationOrDefault("IPPEEK_CACHE_TTL", defaultCacheTTL)
 	if err != nil {
 		return Config{}, err
 	}
-	envProbeTimeout, err := envDurationOrDefault("IP_API_PROBE_TIMEOUT", defaultProbeTimeout)
+	envProbeTimeout, err := envDurationOrDefault("IPPEEK_PROBE_TIMEOUT", defaultProbeTimeout)
 	if err != nil {
 		return Config{}, err
 	}
-	envTrustProxy, err := envBoolOrDefault("IP_API_TRUST_PROXY", false)
+	envTrustProxy, err := envBoolOrDefault("IPPEEK_TRUST_PROXY", false)
 	if err != nil {
 		return Config{}, err
 	}
 
 	var (
-		listen       = fs.String("listen", envListen, "HTTP listen address (env: IP_API_LISTEN)")
-		token        = fs.String("token", envToken, "Required authentication token (env: IP_API_TOKEN)")
-		cacheTTL     = fs.Duration("cache-ttl", envCacheTTL, "Public IP probe cache TTL, 0 disables cache (env: IP_API_CACHE_TTL)")
-		probeTimeout = fs.Duration("probe-timeout", envProbeTimeout, "Timeout per external IP probe (env: IP_API_PROBE_TIMEOUT)")
-		v4ProbesRaw  = fs.String("v4-probes", envV4, "Comma-separated IPv4 probe URLs (env: IP_API_V4_PROBES)")
-		v6ProbesRaw  = fs.String("v6-probes", envV6, "Comma-separated IPv6 probe URLs (env: IP_API_V6_PROBES)")
-		trustProxy   = fs.Bool("trust-proxy", envTrustProxy, "Trust X-Forwarded-For / X-Real-IP headers for client_ip (env: IP_API_TRUST_PROXY)")
+		listen       = fs.String("listen", envListen, "HTTP listen address (env: IPPEEK_LISTEN)")
+		token        = fs.String("token", envToken, "Required authentication token (env: IPPEEK_TOKEN)")
+		cacheTTL     = fs.Duration("cache-ttl", envCacheTTL, "Public IP probe cache TTL, 0 disables cache (env: IPPEEK_CACHE_TTL)")
+		probeTimeout = fs.Duration("probe-timeout", envProbeTimeout, "Timeout per external IP probe (env: IPPEEK_PROBE_TIMEOUT)")
+		v4ProbesRaw  = fs.String("v4-probes", envV4, "Comma-separated IPv4 probe URLs (env: IPPEEK_V4_PROBES)")
+		v6ProbesRaw  = fs.String("v6-probes", envV6, "Comma-separated IPv6 probe URLs (env: IPPEEK_V6_PROBES)")
+		trustProxy   = fs.Bool("trust-proxy", envTrustProxy, "Trust X-Forwarded-For / X-Real-IP headers for client_ip (env: IPPEEK_TRUST_PROXY)")
 	)
 
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +83,7 @@ func LoadConfig(args []string, stderr io.Writer) (Config, error) {
 		return Config{}, errors.New("listen address must not be empty")
 	}
 	if cfg.Token == "" {
-		return Config{}, errors.New("token is required: set -token or IP_API_TOKEN")
+		return Config{}, errors.New("token is required: set -token or IPPEEK_TOKEN")
 	}
 	if cfg.CacheTTL < 0 {
 		return Config{}, errors.New("cache-ttl must be >= 0")
