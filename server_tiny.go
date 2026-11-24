@@ -22,7 +22,6 @@ const (
 	serverEdition      = "tiny"
 	maxReqHeadersBytes = 4096
 	maxReqHeaderLines  = 64
-	maxConcurrentConns = 128
 )
 
 // ServerHandler serves the single /ip endpoint over raw TCP connections
@@ -41,7 +40,8 @@ func NewServerHandler(tokens []string, resolver *Resolver, trustProxy, quietDrop
 // HandleConn processes a single TCP connection and closes it when done.
 func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(h.requestTimeout))
+	// Enforce a strict short deadline for reading request line + headers to prevent Slowloris DoS.
+	_ = conn.SetDeadline(time.Now().Add(h.readHeaderTimeout))
 
 	remoteAddr := ""
 	if conn.RemoteAddr() != nil {
@@ -52,7 +52,11 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 	br := bufio.NewReaderSize(io.LimitReader(conn, maxReqHeadersBytes), 1024)
 	reqLine, err := readReqHeaderLine(br, 1024)
 	if err != nil {
-		h.logDrop("malformed_request", remoteIP, "", "", "")
+		reason := "malformed_request"
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			reason = "header_timeout"
+		}
+		h.logDrop(reason, remoteIP, "", "", "")
 		return
 	}
 
@@ -65,11 +69,17 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 	path, rawQuery, _ := strings.Cut(target, "?")
 
 	var xff, xri string
+	var seenContentLength bool
+	var hasBodyHeader bool
 	headersDone := false
 	for i := 0; i < maxReqHeaderLines; i++ {
 		line, err := readReqHeaderLine(br, 1024)
 		if err != nil {
-			h.logDrop("malformed_headers", remoteIP, method, path, rawQuery)
+			reason := "malformed_headers"
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				reason = "header_timeout"
+			}
+			h.logDrop(reason, remoteIP, method, path, rawQuery)
 			return
 		}
 		if line == "" {
@@ -81,17 +91,28 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 			h.logDrop("malformed_header_line", remoteIP, method, path, rawQuery)
 			return
 		}
-		if h.trustProxy {
-			lk := strings.ToLower(strings.TrimSpace(k))
-			switch lk {
-			case "x-forwarded-for":
-				if xff == "" {
-					xff = strings.TrimSpace(v)
-				}
-			case "x-real-ip":
-				if xri == "" {
-					xri = strings.TrimSpace(v)
-				}
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if lk == "" {
+			h.logDrop("malformed_header_line", remoteIP, method, path, rawQuery)
+			return
+		}
+		switch lk {
+		case "content-length":
+			val := strings.TrimSpace(v)
+			n, perr := strconv.ParseInt(val, 10, 64)
+			if seenContentLength || perr != nil || n != 0 {
+				hasBodyHeader = true
+			}
+			seenContentLength = true
+		case "transfer-encoding":
+			hasBodyHeader = true
+		case "x-forwarded-for":
+			if h.trustProxy && xff == "" {
+				xff = strings.TrimSpace(v)
+			}
+		case "x-real-ip":
+			if h.trustProxy && xri == "" {
+				xri = strings.TrimSpace(v)
 			}
 		}
 	}
@@ -108,6 +129,10 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 	}
 	if method != "GET" && method != "HEAD" {
 		h.logDrop("invalid_method", clientIP, method, path, rawQuery)
+		return
+	}
+	if hasBodyHeader {
+		h.logDrop("unexpected_body_header", clientIP, method, path, rawQuery)
 		return
 	}
 
@@ -127,6 +152,9 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 		h.logDrop("invalid_param_value", clientIP, method, path, rawQuery)
 		return
 	}
+
+	// Only extend the connection deadline after request headers and token auth succeed.
+	_ = conn.SetDeadline(time.Now().Add(h.requestTimeout))
 
 	reqCtx, cancel := context.WithTimeout(ctx, h.requestTimeout)
 	defer cancel()
@@ -226,16 +254,23 @@ func (h *ServerHandler) writeResponse(conn net.Conn, method string, status int, 
 }
 
 func (h *ServerHandler) serve(ctx context.Context, ln net.Listener) error {
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxConcurrentConns)
+	limitedLn := newLimitedListener(ln, h.maxConns, h.maxConnsPerIP, func(reason, ip string) {
+		h.logDrop(reason, ip, "", "", "")
+	})
+
+	var (
+		wg       sync.WaitGroup
+		activeMu sync.Mutex
+		active   = make(map[net.Conn]struct{})
+	)
 
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
+		_ = limitedLn.Close()
 	}()
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := limitedLn.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				break
@@ -244,22 +279,38 @@ func (h *ServerHandler) serve(ctx context.Context, ln net.Listener) error {
 			continue
 		}
 
-		select {
-		case sem <- struct{}{}:
-			wg.Add(1)
-			go func(c net.Conn) {
-				defer func() {
-					<-sem
-					wg.Done()
-				}()
-				h.HandleConn(ctx, c)
-			}(conn)
-		default:
-			_ = conn.Close()
-		}
+		activeMu.Lock()
+		active[conn] = struct{}{}
+		activeMu.Unlock()
+
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer func() {
+				activeMu.Lock()
+				delete(active, c)
+				activeMu.Unlock()
+				wg.Done()
+			}()
+			h.HandleConn(ctx, c)
+		}(conn)
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(h.shutdownTimeout):
+		activeMu.Lock()
+		for c := range active {
+			_ = c.Close()
+		}
+		activeMu.Unlock()
+		<-done
+	}
 	return nil
 }
 

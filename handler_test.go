@@ -410,3 +410,261 @@ func TestHandlerUnavailableIPStatusCodes(t *testing.T) {
 		t.Fatalf("expected ipv6 error in partial overview: %+v", ov.IPv6)
 	}
 }
+
+func TestSlowHeaderTimeoutDrop(t *testing.T) {
+	addr, logBuf, _ := startTestServer(t, []string{"super-secret"}, &stubProber{
+		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
+	}, nil, false, false, func(h *ServerHandler) {
+		h.readHeaderTimeout = 150 * time.Millisecond
+		h.requestTimeout = 5 * time.Second
+	})
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	start := time.Now()
+	// Send incomplete headers and stall (Slowloris pattern).
+	if _, err := conn.Write([]byte("GET /ip?token=super-secret HTTP/1.1\r\nHost: localhost\r\n")); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	data, err := io.ReadAll(conn)
+	elapsed := time.Since(start)
+	if len(data) != 0 {
+		t.Fatalf("expected 0 response bytes on slow-header timeout, got %d bytes: %q (err=%v)", len(data), string(data), err)
+	}
+	if elapsed > 1200*time.Millisecond {
+		t.Fatalf("slow-header timeout took too long: %v (expected ~150ms)", elapsed)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if strings.Contains(logBuf.String(), "super-secret") {
+		t.Fatalf("token leaked on header timeout:\n%s", logBuf.String())
+	}
+}
+
+func TestBodyHeader444Drop(t *testing.T) {
+	prober := &stubProber{
+		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
+	}
+	addr, logBuf, _ := startTestServer(t, []string{"super-secret"}, prober, nil, false, false, nil)
+
+	dropCases := []struct {
+		name string
+		raw  string
+	}{
+		{"GET with non-zero Content-Length", "GET /ip?token=super-secret&v=4 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello"},
+		{"HEAD with non-zero Content-Length", "HEAD /ip?token=super-secret&v=4 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n"},
+		{"GET with Transfer-Encoding chunked", "GET /ip?token=super-secret&v=4 HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"},
+	}
+
+	for _, tc := range dropCases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial failed: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+			if _, err := conn.Write([]byte(tc.raw)); err != nil {
+				t.Fatalf("write failed: %v", err)
+			}
+			data, err := io.ReadAll(conn)
+			if len(data) != 0 {
+				t.Fatalf("expected 444 drop (0 bytes), got %d bytes: %q (err=%v)", len(data), string(data), err)
+			}
+		})
+	}
+
+	// Content-Length: 0 on GET should still be allowed.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write([]byte("GET /ip?token=super-secret&v=4 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	respBytes, _ := io.ReadAll(conn)
+	if !strings.Contains(string(respBytes), "200 OK") || !strings.HasSuffix(string(respBytes), "1.2.3.4") {
+		t.Fatalf("expected 200 OK for Content-Length: 0, got %q", string(respBytes))
+	}
+
+	if strings.Contains(logBuf.String(), "super-secret") {
+		t.Fatalf("token leaked in body-header drop logs:\n%s", logBuf.String())
+	}
+}
+
+func TestPerIPConnectionLimit(t *testing.T) {
+	prober := &stubProber{
+		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
+	}
+	addr, logBuf, _ := startTestServer(t, []string{"super-secret"}, prober, nil, false, false, func(h *ServerHandler) {
+		h.maxConns = 16
+		h.maxConnsPerIP = 2
+		h.readHeaderTimeout = 3 * time.Second
+	})
+
+	// Hold 2 connections open from 127.0.0.1.
+	held := make([]net.Conn, 0, 2)
+	for i := 0; i < 2; i++ {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		_, _ = c.Write([]byte("GET /"))
+		held = append(held, c)
+	}
+	defer func() {
+		for _, c := range held {
+			_ = c.Close()
+		}
+	}()
+
+	time.Sleep(40 * time.Millisecond)
+
+	// 3rd concurrent connection from same IP must be dropped immediately with 0 bytes.
+	c3, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial 3 failed: %v", err)
+	}
+	_ = c3.SetDeadline(time.Now().Add(1 * time.Second))
+	_, _ = c3.Write([]byte("GET /ip?token=super-secret&v=4 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
+	data, _ := io.ReadAll(c3)
+	_ = c3.Close()
+	if len(data) != 0 {
+		t.Fatalf("expected 3rd connection from same IP to be dropped (0 bytes), got %q", string(data))
+	}
+
+	// Release held connections and verify new request succeeds.
+	for _, c := range held {
+		_ = c.Close()
+	}
+	held = nil
+	time.Sleep(60 * time.Millisecond)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/ip?token=super-secret&v=4")
+	if err != nil {
+		t.Fatalf("GET after releasing per-IP slots failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(body) != "1.2.3.4" {
+		t.Fatalf("unexpected response after release: status=%d body=%q", resp.StatusCode, string(body))
+	}
+
+	if !strings.Contains(logBuf.String(), "ip_conn_limit") {
+		t.Fatalf("expected ip_conn_limit in drop logs:\n%s", logBuf.String())
+	}
+}
+
+func TestDropLogRateLimitingAndQuietDrops(t *testing.T) {
+	// Unit test dropLogLimiter directly with deterministic timestamps.
+	lim := newDropLogLimiter(3, 200*time.Millisecond)
+	t0 := time.Date(2026, 11, 22, 17, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		ok, sup := lim.Allow(t0)
+		if !ok || sup != 0 {
+			t.Fatalf("burst %d: got ok=%v sup=%d, want true, 0", i, ok, sup)
+		}
+	}
+	for i := 0; i < 5; i++ {
+		if ok, _ := lim.Allow(t0); ok {
+			t.Fatalf("expected rate-limited denial at step %d", i)
+		}
+	}
+	ok, sup := lim.Allow(t0.Add(200 * time.Millisecond))
+	if !ok || sup != 5 {
+		t.Fatalf("after refill: got ok=%v sup=%d, want true, 5", ok, sup)
+	}
+
+	// Server-level drop-log rate limiting test.
+	addr, logBuf, _ := startTestServer(t, []string{"super-secret"}, &stubProber{}, nil, false, false, func(h *ServerHandler) {
+		h.dropLimiter = newDropLogLimiter(2, time.Hour)
+	})
+	for i := 0; i < 6; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial %d failed: %v", i, err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+		_, _ = io.ReadAll(conn)
+		_ = conn.Close()
+	}
+	time.Sleep(20 * time.Millisecond)
+	lines := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected drop logs capped at 2, got %d lines:\n%s", len(lines), logBuf.String())
+	}
+
+	// Quiet drops suppresses 444 drop logs while keeping normal access logs.
+	prober := &stubProber{v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"}}
+	qAddr, qLogs, _ := startTestServer(t, []string{"super-secret"}, prober, nil, false, true, nil)
+	conn, err := net.DialTimeout("tcp", qAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial quiet failed: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	_, _ = io.ReadAll(conn)
+	_ = conn.Close()
+	time.Sleep(20 * time.Millisecond)
+	if qLogs.String() != "" {
+		t.Fatalf("expected 0 drop logs with quietDrops=true, got:\n%s", qLogs.String())
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + qAddr + "/ip?token=super-secret&v=4")
+	if err != nil {
+		t.Fatalf("GET quiet server failed: %v", err)
+	}
+	resp.Body.Close()
+	if !strings.Contains(qLogs.String(), " 200 remote=") {
+		t.Fatalf("expected normal 200 access log even with quietDrops=true, got:\n%s", qLogs.String())
+	}
+}
+
+func TestBoundedGracefulShutdown(t *testing.T) {
+	logBuf := &lockedBuffer{}
+	resolver := NewResolver(stubInterfaceProvider{}, &stubProber{})
+	handler := NewServerHandler([]string{"super-secret"}, resolver, false, true, logBuf)
+	handler.readHeaderTimeout = 5 * time.Second
+	handler.shutdownTimeout = 150 * time.Millisecond
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.serve(ctx, ln)
+	}()
+
+	// Hold an open idle connection that never finishes its request.
+	stuck, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer stuck.Close()
+	_, _ = stuck.Write([]byte("GET /"))
+	time.Sleep(30 * time.Millisecond)
+
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+		if elapsed := time.Since(start); elapsed > 1200*time.Millisecond {
+			t.Fatalf("shutdown took too long: %v (expected <= ~150ms)", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server.serve hung on stuck idle connection during shutdown")
+	}
+}

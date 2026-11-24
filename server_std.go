@@ -46,6 +46,13 @@ func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.drop(w, r, "invalid_method")
 		return
 	}
+	if r.ContentLength > 0 || r.ContentLength == -1 ||
+		len(r.TransferEncoding) > 0 ||
+		len(r.Header.Values("Transfer-Encoding")) > 0 ||
+		len(r.Header.Values("Content-Length")) > 1 {
+		h.drop(w, r, "unexpected_body_header")
+		return
+	}
 
 	q, ok := parseStrictQuery(r.URL.RawQuery)
 	if !ok {
@@ -153,6 +160,9 @@ func dropConn(w http.ResponseWriter) {
 }
 
 func (h *ServerHandler) serve(ctx context.Context, ln net.Listener) error {
+	limitedLn := newLimitedListener(ln, h.maxConns, h.maxConnsPerIP, func(reason, ip string) {
+		h.logDrop(reason, ip, "", "", "")
+	})
 	server := &http.Server{
 		Handler:           h, // Mounted directly (no ServeMux) so all invalid paths drop with 444.
 		ReadHeaderTimeout: h.readHeaderTimeout,
@@ -165,7 +175,7 @@ func (h *ServerHandler) serve(ctx context.Context, ln net.Listener) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- server.Serve(ln)
+		errCh <- server.Serve(limitedLn)
 	}()
 
 	select {
@@ -178,6 +188,9 @@ func (h *ServerHandler) serve(ctx context.Context, ln net.Listener) error {
 		shutCtx, cancel := context.WithTimeout(context.Background(), h.shutdownTimeout)
 		defer cancel()
 		err := server.Shutdown(shutCtx)
+		if err != nil {
+			_ = server.Close()
+		}
 		<-errCh
 		return err
 	}

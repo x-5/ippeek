@@ -13,10 +13,14 @@ import (
 )
 
 const (
-	defaultReadHeaderTimeout = 2 * time.Second
-	defaultRequestTimeout    = 10 * time.Second
-	defaultShutdownTimeout   = 5 * time.Second
-	maxLogFieldLen           = 256
+	defaultReadHeaderTimeout  = 2 * time.Second
+	defaultRequestTimeout     = 10 * time.Second
+	defaultShutdownTimeout    = 5 * time.Second
+	defaultMaxConcurrentConns = 128
+	defaultMaxConnsPerIP      = 8
+	defaultDropLogBurst       = 30
+	defaultDropLogInterval    = 200 * time.Millisecond // 5 drop logs/sec sustained
+	maxLogFieldLen            = 256
 )
 
 var allowedQueryKeys = map[string]struct{}{
@@ -41,6 +45,9 @@ type handlerCore struct {
 	readHeaderTimeout time.Duration
 	requestTimeout    time.Duration
 	shutdownTimeout   time.Duration
+	maxConns          int
+	maxConnsPerIP     int
+	dropLimiter       *dropLogLimiter
 }
 
 func newHandlerCore(tokens []string, resolver *Resolver, trustProxy, quietDrops bool, logOut io.Writer) handlerCore {
@@ -62,6 +69,9 @@ func newHandlerCore(tokens []string, resolver *Resolver, trustProxy, quietDrops 
 		readHeaderTimeout: defaultReadHeaderTimeout,
 		requestTimeout:    defaultRequestTimeout,
 		shutdownTimeout:   defaultShutdownTimeout,
+		maxConns:          defaultMaxConcurrentConns,
+		maxConnsPerIP:     defaultMaxConnsPerIP,
+		dropLimiter:       newDropLogLimiter(defaultDropLogBurst, defaultDropLogInterval),
 	}
 }
 
@@ -92,13 +102,19 @@ func (c *handlerCore) logDrop(reason, remote, method, path, rawQuery string) {
 	if c.quietDrops {
 		return
 	}
-	c.logLine(
-		"444 drop (" + sanitizeLogField(reason) + ")" +
-			" remote=" + sanitizeLogField(remote) +
-			" method=" + sanitizeLogField(method) +
-			" path=" + sanitizeLogField(path) +
-			" query=" + sanitizeLogField(redactQuery(rawQuery)),
-	)
+	allowed, suppressed := c.dropLimiter.Allow(c.now())
+	if !allowed {
+		return
+	}
+	msg := "444 drop (" + sanitizeLogField(reason) + ")" +
+		" remote=" + sanitizeLogField(remote) +
+		" method=" + sanitizeLogField(method) +
+		" path=" + sanitizeLogField(path) +
+		" query=" + sanitizeLogField(redactQuery(rawQuery))
+	if suppressed > 0 {
+		msg += " suppressed=" + strconv.FormatUint(suppressed, 10)
+	}
+	c.logLine(msg)
 }
 
 func (c *handlerCore) logLine(msg string) {
@@ -422,4 +438,171 @@ func extractClientIP(remoteAddr, xff, xri string, trustProxy bool) string {
 		return host
 	}
 	return remoteAddr
+}
+
+// ipConnLimiter enforces a per-client-IP concurrent connection limit.
+type ipConnLimiter struct {
+	mu     sync.Mutex
+	max    int
+	counts map[string]int
+}
+
+func newIPConnLimiter(maxPerIP int) *ipConnLimiter {
+	if maxPerIP <= 0 {
+		maxPerIP = defaultMaxConnsPerIP
+	}
+	return &ipConnLimiter{
+		max:    maxPerIP,
+		counts: make(map[string]int),
+	}
+}
+
+func (l *ipConnLimiter) Acquire(ip string) bool {
+	if l == nil || l.max <= 0 {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.counts[ip] >= l.max {
+		return false
+	}
+	l.counts[ip]++
+	return true
+}
+
+func (l *ipConnLimiter) Release(ip string) {
+	if l == nil || l.max <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if n := l.counts[ip]; n <= 1 {
+		delete(l.counts, ip)
+	} else {
+		l.counts[ip] = n - 1
+	}
+}
+
+type limitedListener struct {
+	net.Listener
+	sem    chan struct{}
+	perIP  *ipConnLimiter
+	onDrop func(reason, ip string)
+}
+
+func newLimitedListener(ln net.Listener, maxGlobal, maxPerIP int, onDrop func(reason, ip string)) net.Listener {
+	if maxGlobal <= 0 {
+		maxGlobal = defaultMaxConcurrentConns
+	}
+	if maxPerIP <= 0 {
+		maxPerIP = defaultMaxConnsPerIP
+	}
+	return &limitedListener{
+		Listener: ln,
+		sem:      make(chan struct{}, maxGlobal),
+		perIP:    newIPConnLimiter(maxPerIP),
+		onDrop:   onDrop,
+	}
+}
+
+func (l *limitedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		ip := peerIP(c.RemoteAddr())
+		if !l.perIP.Acquire(ip) {
+			_ = c.Close()
+			if l.onDrop != nil {
+				l.onDrop("ip_conn_limit", ip)
+			}
+			continue
+		}
+		select {
+		case l.sem <- struct{}{}:
+			return &trackedConn{
+				Conn: c,
+				release: func() {
+					<-l.sem
+					l.perIP.Release(ip)
+				},
+			}, nil
+		default:
+			l.perIP.Release(ip)
+			_ = c.Close()
+			if l.onDrop != nil {
+				l.onDrop("global_conn_limit", ip)
+			}
+		}
+	}
+}
+
+type trackedConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
+// dropLogLimiter is a lightweight token-bucket rate limiter for 444 drop log lines.
+type dropLogLimiter struct {
+	mu         sync.Mutex
+	burst      int
+	interval   time.Duration
+	tokens     int
+	lastRefill time.Time
+	suppressed uint64
+}
+
+func newDropLogLimiter(burst int, interval time.Duration) *dropLogLimiter {
+	if burst <= 0 {
+		burst = defaultDropLogBurst
+	}
+	if interval <= 0 {
+		interval = defaultDropLogInterval
+	}
+	return &dropLogLimiter{
+		burst:    burst,
+		interval: interval,
+		tokens:   burst,
+	}
+}
+
+func (l *dropLogLimiter) Allow(now time.Time) (bool, uint64) {
+	if l == nil {
+		return true, 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.lastRefill.IsZero() {
+		l.lastRefill = now
+	} else if elapsed := now.Sub(l.lastRefill); elapsed > 0 {
+		if elapsed >= time.Duration(l.burst)*l.interval {
+			l.tokens = l.burst
+			l.lastRefill = now
+		} else if elapsed >= l.interval {
+			add := int(elapsed / l.interval)
+			l.tokens += add
+			if l.tokens > l.burst {
+				l.tokens = l.burst
+			}
+			l.lastRefill = l.lastRefill.Add(time.Duration(add) * l.interval)
+		}
+	}
+
+	if l.tokens > 0 {
+		l.tokens--
+		sup := l.suppressed
+		l.suppressed = 0
+		return true, sup
+	}
+	l.suppressed++
+	return false, 0
 }
