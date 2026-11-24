@@ -668,3 +668,195 @@ func TestBoundedGracefulShutdown(t *testing.T) {
 		t.Fatal("server.serve hung on stuck idle connection during shutdown")
 	}
 }
+
+func TestMultiTokenRotation(t *testing.T) {
+	prober := &stubProber{
+		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
+	}
+	tokens := []string{"tok_new_alpha", "tok_old_beta", "tok_extra_gamma"}
+	addr, logBuf, _ := startTestServer(t, tokens, prober, nil, false, false, nil)
+	baseURL := "http://" + addr
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	for _, tok := range tokens {
+		resp, err := client.Get(baseURL + "/ip?token=" + tok + "&v=4")
+		if err != nil {
+			t.Fatalf("GET with valid token %q failed: %v", tok, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(body) != "1.2.3.4" {
+			t.Fatalf("token %q unexpected response: status=%d body=%q", tok, resp.StatusCode, string(body))
+		}
+	}
+
+	// Unknown token must drop with 0 bytes.
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write([]byte("GET /ip?token=tok_revoked_delta&v=4 HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	data, _ := io.ReadAll(conn)
+	_ = conn.Close()
+	if len(data) != 0 {
+		t.Fatalf("expected 444 drop for unknown token, got %q", string(data))
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	logs := logBuf.String()
+	for _, secret := range append(tokens, "tok_revoked_delta") {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("secret %q leaked into logs:\n%s", secret, logs)
+		}
+	}
+}
+
+func TestTrustProxyClientIP(t *testing.T) {
+	prober := &stubProber{
+		v4Res: ProbeResult{IP: "1.2.3.4", Probe: "http://4.ipw.cn"},
+	}
+
+	// trustProxy=true honors valid X-Forwarded-For and falls back to X-Real-IP.
+	addrTrust, _, _ := startTestServer(t, []string{"super-secret"}, prober, nil, true, false, nil)
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	req, _ := http.NewRequest("GET", "http://"+addrTrust+"/ip?token=super-secret", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10, 10.0.0.1")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET trustProxy XFF failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var ov jsonOverview
+	if err := json.Unmarshal(body, &ov); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if ov.ClientIP != "203.0.113.10" {
+		t.Fatalf("expected client_ip=203.0.113.10, got %q", ov.ClientIP)
+	}
+
+	req2, _ := http.NewRequest("GET", "http://"+addrTrust+"/ip?token=super-secret", nil)
+	req2.Header.Set("X-Forwarded-For", "not-an-ip")
+	req2.Header.Set("X-Real-IP", "198.51.100.7")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("GET trustProxy XRI failed: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	var ov2 jsonOverview
+	if err := json.Unmarshal(body2, &ov2); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if ov2.ClientIP != "198.51.100.7" {
+		t.Fatalf("expected client_ip=198.51.100.7, got %q", ov2.ClientIP)
+	}
+
+	// trustProxy=false ignores X-Forwarded-For and uses peer IP.
+	addrNoTrust, _, _ := startTestServer(t, []string{"super-secret"}, prober, nil, false, false, nil)
+	req3, _ := http.NewRequest("GET", "http://"+addrNoTrust+"/ip?token=super-secret", nil)
+	req3.Header.Set("X-Forwarded-For", "203.0.113.10")
+	resp3, err := client.Do(req3)
+	if err != nil {
+		t.Fatalf("GET noTrust failed: %v", err)
+	}
+	body3, _ := io.ReadAll(resp3.Body)
+	resp3.Body.Close()
+	var ov3 jsonOverview
+	if err := json.Unmarshal(body3, &ov3); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if ov3.ClientIP != "127.0.0.1" {
+		t.Fatalf("expected peer client_ip=127.0.0.1 when trustProxy=false, got %q", ov3.ClientIP)
+	}
+}
+
+func TestConfigLoadingAndFlags(t *testing.T) {
+	t.Setenv("IPPEEK_TOKEN", "")
+	t.Setenv("IPPEEK_LISTEN", "")
+	t.Setenv("IPPEEK_CACHE_TTL", "")
+	t.Setenv("IPPEEK_PROBE_TIMEOUT", "")
+	t.Setenv("IPPEEK_TRUST_PROXY", "")
+	t.Setenv("IPPEEK_QUIET_DROPS", "")
+
+	// Missing token must fail.
+	if _, err := LoadConfig([]string{}); err == nil {
+		t.Fatal("expected error when token is missing")
+	}
+
+	// Whitespace/comma-only token must fail.
+	if _, err := LoadConfig([]string{"-token", " , , "}); err == nil {
+		t.Fatal("expected error when token list is empty after trimming")
+	}
+
+	// -version succeeds without requiring a token.
+	for _, flag := range [][]string{{"-version"}, {"--version"}, {"-version=true"}} {
+		cfg, err := LoadConfig(flag)
+		if err != nil {
+			t.Fatalf("LoadConfig(%v) failed: %v", flag, err)
+		}
+		if !cfg.ShowVersion {
+			t.Fatalf("LoadConfig(%v) expected ShowVersion=true", flag)
+		}
+	}
+	if _, err := LoadConfig([]string{"-version=false"}); err == nil {
+		t.Fatal("expected -version=false without token to fail")
+	}
+
+	// -h / --help returns ErrHelp.
+	if _, err := LoadConfig([]string{"-h"}); !errors.Is(err, ErrHelp) {
+		t.Fatalf("expected ErrHelp for -h, got %v", err)
+	}
+
+	// Env vars including comma-separated multi-token and quiet-drops.
+	t.Setenv("IPPEEK_TOKEN", "tok_new, tok_old ")
+	t.Setenv("IPPEEK_LISTEN", ":9090")
+	t.Setenv("IPPEEK_QUIET_DROPS", "true")
+	t.Setenv("IPPEEK_TRUST_PROXY", "1")
+	cfg, err := LoadConfig([]string{})
+	if err != nil {
+		t.Fatalf("LoadConfig with env failed: %v", err)
+	}
+	if len(cfg.Tokens) != 2 || cfg.Tokens[0] != "tok_new" || cfg.Tokens[1] != "tok_old" {
+		t.Fatalf("unexpected env tokens: %+v", cfg.Tokens)
+	}
+	if cfg.Listen != ":9090" || !cfg.QuietDrops || !cfg.TrustProxy {
+		t.Fatalf("unexpected env config: %+v", cfg)
+	}
+
+	// CLI flags override env vars.
+	cfg, err = LoadConfig([]string{
+		"-token", "cli_a,cli_b",
+		"--listen=127.0.0.1:7070",
+		"-cache-ttl", "15s",
+		"-probe-timeout=2s",
+		"-trust-proxy=false",
+		"-quiet-drops=false",
+	})
+	if err != nil {
+		t.Fatalf("LoadConfig with flags failed: %v", err)
+	}
+	if len(cfg.Tokens) != 2 || cfg.Tokens[0] != "cli_a" || cfg.Tokens[1] != "cli_b" {
+		t.Fatalf("unexpected CLI tokens: %+v", cfg.Tokens)
+	}
+	if cfg.Listen != "127.0.0.1:7070" || cfg.CacheTTL != 15*time.Second || cfg.ProbeTimeout != 2*time.Second || cfg.TrustProxy || cfg.QuietDrops {
+		t.Fatalf("unexpected CLI config: %+v", cfg)
+	}
+
+	// Error cases.
+	badArgs := [][]string{
+		{"positional"},
+		{"---token", "abc"},
+		{"-unknown"},
+		{"-token"},
+		{"-cache-ttl", "-1s"},
+		{"-probe-timeout", "0s"},
+	}
+	for _, args := range badArgs {
+		if _, err := LoadConfig(args); err == nil {
+			t.Errorf("expected error for args %v, got nil", args)
+		}
+	}
+}
