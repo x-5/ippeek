@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Vet and test (std & tiny)
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test -v -race ./...
+          go vet -tags tiny ./...
+          go test -tags tiny -v -race ./...
+
+      - name: Verify tiny build dependency isolation
+        run: |
+          set -euo pipefail
+          if go list -tags tiny -deps . | grep -E '^(net/http|crypto/tls)$'; then
+            echo "ERROR: tiny build unexpectedly links net/http or crypto/tls" >&2
+            exit 1
+          fi
+          echo "OK: tiny build does not link net/http or crypto/tls"
+
+      - name: Install UPX 5.0.2
+        run: |
+          set -euo pipefail
+          UPX_VERSION="5.0.2"
+          curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
+          tar -xJf /tmp/upx.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version
+
+      - name: Cross-compile matrix (std, tiny, tiny-upx) and verify binary size
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VER="ci-${GITHUB_SHA::7}"
+          LDFLAGS="-s -w -X main.version=${VER}"
+
+          build_matrix() {
+            local prefix="$1" tags="$2"
+            local tflag=()
+            if [ -n "${tags}" ]; then
+              tflag=(-tags "${tags}")
+            fi
+            CGO_ENABLED=0 GOOS=linux   GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-amd64" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-arm64" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=7          go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-armv7" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=6          go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-armv6" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=mipsle  GOMIPS=softfloat go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-mipsle-softfloat" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=mips    GOMIPS=softfloat go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-mips-softfloat" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=riscv64                  go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-linux-riscv64" .
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-windows-amd64.exe" .
+            CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-darwin-arm64" .
+            CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "dist/${prefix}-darwin-amd64" .
+          }
+
+          build_matrix ippeek-std  ""
+          build_matrix ippeek-tiny "tiny"
+
+          for arch in linux-amd64 linux-arm64 linux-armv7 linux-armv6 linux-mipsle-softfloat linux-mips-softfloat windows-amd64.exe; do
+            cp "dist/ippeek-tiny-${arch}" "dist/ippeek-tiny-upx-${arch}"
+            upx --best --lzma -q "dist/ippeek-tiny-upx-${arch}"
+          done
+
+          ls -lh dist/
+          TINY_UPX_SIZE=$(stat -c%s dist/ippeek-tiny-upx-linux-amd64)
+          echo "ippeek-tiny-upx-linux-amd64 size: ${TINY_UPX_SIZE} bytes"
+          if [ "${TINY_UPX_SIZE}" -ge 1048576 ]; then
+            echo "ERROR: ippeek-tiny-upx-linux-amd64 (${TINY_UPX_SIZE} bytes) exceeds 1048576 bytes (1 MB)" >&2
+            exit 1
+          fi
+
+      - name: Validate install.sh and run live smoke tests
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          ./install.sh --help >/dev/null
+
+          smoke_test() {
+            local bin="$1" port="$2"
+            echo "=== Smoke test: ${bin} (127.0.0.1:${port}) ==="
+            "${bin}" -version
+            IPPEEK_TOKEN="ci-smoke-secret" "${bin}" -listen "127.0.0.1:${port}" &
+            local pid=$!
+            trap 'kill "${pid}" 2>/dev/null || true; wait "${pid}" 2>/dev/null || true' RETURN
+
+            local ready=0 rc=0
+            for _ in $(seq 1 25); do
+              rc=0
+              curl -sS --max-time 2 "http://127.0.0.1:${port}/" >/dev/null 2>&1 || rc=$?
+              if [ "${rc}" -eq 52 ]; then
+                ready=1
+                break
+              fi
+              sleep 0.2
+            done
+            if [ "${ready}" -ne 1 ]; then
+              echo "ERROR: ${bin} did not drop GET / with curl exit 52 (last exit=${rc})" >&2
+              exit 1
+            fi
+            echo "PASS: 444 drop (curl exit 52)"
+
+            local out http_code body
+            out="$(printf 'url = "http://127.0.0.1:%s/ip?token=ci-smoke-secret&v=4&iface=lo&source=local"\n' "${port}" | curl -fsS --max-time 3 -w '\n%{http_code}' -K -)"
+            http_code="$(printf '%s\n' "${out}" | tail -n 1)"
+            body="$(printf '%s\n' "${out}" | head -n 1)"
+            if [ "${http_code}" != "200" ] || [ "${body}" != "127.0.0.1" ]; then
+              echo "ERROR: expected HTTP 200 and '127.0.0.1' from ${bin}, got status=${http_code} body='${body}'" >&2
+              exit 1
+            fi
+            echo "PASS: 200 OK loopback (${body})"
+
+            kill "${pid}" 2>/dev/null || true
+            wait "${pid}" 2>/dev/null || true
+            trap - RETURN
+          }
+
+          smoke_test ./dist/ippeek-std-linux-amd64 18081
+          smoke_test ./dist/ippeek-tiny-upx-linux-amd64 18082

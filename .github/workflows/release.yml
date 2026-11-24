@@ -17,54 +17,65 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout std (master)
+      - name: Checkout tagged commit
         uses: actions/checkout@v4
         with:
-          ref: master
-          path: src-std
-
-      - name: Checkout tiny (go-tiny)
-        uses: actions/checkout@v4
-        with:
-          ref: go-tiny
-          path: src-tiny
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.23"
 
-      - name: Install UPX
-        run: sudo apt-get update && sudo apt-get install -y upx-ucl
-
-      - name: Test both editions
+      - name: Install UPX 5.0.2
         run: |
-          (cd src-std  && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
-          (cd src-tiny && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test ./...)
+          set -euo pipefail
+          UPX_VERSION="5.0.2"
+          curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/upx-${UPX_VERSION}-amd64_linux.tar.xz" -o /tmp/upx.tar.xz
+          tar -xJf /tmp/upx.tar.xz -C /tmp
+          sudo install -m 0755 "/tmp/upx-${UPX_VERSION}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version
+
+      - name: Vet and test both editions
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test -race ./...
+          go vet -tags tiny ./...
+          go test -tags tiny -race ./...
+          if go list -tags tiny -deps . | grep -E '^(net/http|crypto/tls)$'; then
+            echo "ERROR: tiny build unexpectedly links net/http or crypto/tls" >&2
+            exit 1
+          fi
 
       - name: Build std, tiny, and tiny-upx binaries
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p release-assets
+          LDFLAGS="-s -w -X main.version=${TAG}"
+
           build_matrix() {
-            local src_dir="$1" prefix="$2"
-            (
-              cd "${src_dir}"
-              CGO_ENABLED=0 GOOS=linux   GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-amd64" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=arm64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-arm64" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=7          go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-armv7" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=6          go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-armv6" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=mipsle  GOMIPS=softfloat go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-mipsle-softfloat" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=mips    GOMIPS=softfloat go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-mips-softfloat" .
-              CGO_ENABLED=0 GOOS=linux   GOARCH=riscv64                  go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-linux-riscv64" .
-              CGO_ENABLED=0 GOOS=windows GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-windows-amd64.exe" .
-              CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-darwin-arm64" .
-              CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64                    go build -trimpath -ldflags="-s -w" -o "../release-assets/${prefix}-darwin-amd64" .
-            )
+            local prefix="$1" tags="$2"
+            local tflag=()
+            if [ -n "${tags}" ]; then
+              tflag=(-tags "${tags}")
+            fi
+            CGO_ENABLED=0 GOOS=linux   GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-amd64" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-arm64" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=7          go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-armv7" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=arm     GOARM=6          go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-armv6" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=mipsle  GOMIPS=softfloat go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-mipsle-softfloat" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=mips    GOMIPS=softfloat go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-mips-softfloat" .
+            CGO_ENABLED=0 GOOS=linux   GOARCH=riscv64                  go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-linux-riscv64" .
+            CGO_ENABLED=0 GOOS=windows GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-windows-amd64.exe" .
+            CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-darwin-arm64" .
+            CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64                    go build -trimpath ${tflag[@]+"${tflag[@]}"} -ldflags="${LDFLAGS}" -o "release-assets/${prefix}-darwin-amd64" .
           }
 
-          build_matrix src-std  ippeek-std
-          build_matrix src-tiny ippeek-tiny
+          build_matrix ippeek-std  ""
+          build_matrix ippeek-tiny "tiny"
 
           for arch in linux-amd64 linux-arm64 linux-armv7 linux-armv6 linux-mipsle-softfloat linux-mips-softfloat windows-amd64.exe; do
             cp "release-assets/ippeek-tiny-${arch}" "release-assets/ippeek-tiny-upx-${arch}"
@@ -79,6 +90,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "${TAG}" release-assets/* \
-            --title "${TAG}" \
-            --generate-notes
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" release-assets/* --clobber
+          else
+            gh release create "${TAG}" release-assets/* \
+              --title "${TAG}" \
+              --generate-notes
+          fi
