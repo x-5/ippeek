@@ -19,11 +19,6 @@ import (
 
 const serverEdition = "std"
 
-type overviewPayload struct {
-	OverviewResponse
-	Version string `json:"version,omitempty"`
-}
-
 // ServerHandler serves the single /ip endpoint via net/http and drops all non-conforming requests (Nginx 444 semantics).
 type ServerHandler struct {
 	handlerCore
@@ -86,16 +81,14 @@ func (h *ServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	clientIP := h.reqClientIP(r)
 	if format == "json" {
-		payload := overviewPayload{
-			OverviewResponse: OverviewResponse{
-				IPv4:       res.IPv4,
-				IPv6:       res.IPv6,
-				Interfaces: res.Interfaces,
-				ClientIP:   clientIP,
-				Hostname:   h.hostname,
-				Timestamp:  h.now().UTC().Format(time.RFC3339),
-			},
-			Version: version,
+		payload := OverviewResponse{
+			Version:    version,
+			IPv4:       res.IPv4,
+			IPv6:       res.IPv6,
+			Interfaces: res.Interfaces,
+			ClientIP:   clientIP,
+			Hostname:   h.hostname,
+			Timestamp:  h.now().UTC().Format(time.RFC3339),
 		}
 		h.writeJSON(w, r, http.StatusOK, payload)
 		return

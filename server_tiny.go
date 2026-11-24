@@ -154,7 +154,8 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// Only extend the connection deadline after request headers and token auth succeed.
-	_ = conn.SetDeadline(time.Now().Add(h.requestTimeout))
+	// Allow extra write headroom beyond requestTimeout so 503/JSON responses flush even when probes time out.
+	_ = conn.SetDeadline(time.Now().Add(h.requestTimeout + 5*time.Second))
 
 	reqCtx, cancel := context.WithTimeout(ctx, h.requestTimeout)
 	defer cancel()
@@ -171,6 +172,7 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 
 	if format == "json" {
 		payload := OverviewResponse{
+			Version:    version,
 			IPv4:       res.IPv4,
 			IPv6:       res.IPv6,
 			Interfaces: res.Interfaces,
@@ -178,7 +180,7 @@ func (h *ServerHandler) HandleConn(ctx context.Context, conn net.Conn) {
 			Hostname:   h.hostname,
 			Timestamp:  h.now().UTC().Format(time.RFC3339),
 		}
-		body := marshalOverviewJSON(payload, version)
+		body := marshalOverviewJSON(payload)
 		h.writeResponse(conn, method, 200, "OK", "application/json; charset=utf-8", body, clientIP, path, rawQuery)
 		return
 	}
@@ -356,7 +358,7 @@ func runServer(cfg Config, resolver *Resolver) error {
 
 // --- Zero-reflection JSON encoder ---
 
-func marshalOverviewJSON(ov OverviewResponse, ver string) []byte {
+func marshalOverviewJSON(ov OverviewResponse) []byte {
 	var b bytes.Buffer
 	b.Grow(512)
 	b.WriteByte('{')
@@ -369,6 +371,11 @@ func marshalOverviewJSON(ov OverviewResponse, ver string) []byte {
 		first = false
 	}
 
+	if ov.Version != "" {
+		addComma()
+		b.WriteString(`"version":`)
+		writeJSONString(&b, ov.Version)
+	}
 	if ov.IPv4 != nil {
 		addComma()
 		b.WriteString(`"ipv4":`)
@@ -399,11 +406,6 @@ func marshalOverviewJSON(ov OverviewResponse, ver string) []byte {
 		addComma()
 		b.WriteString(`"hostname":`)
 		writeJSONString(&b, ov.Hostname)
-	}
-	if ver != "" {
-		addComma()
-		b.WriteString(`"version":`)
-		writeJSONString(&b, ver)
 	}
 	addComma()
 	b.WriteString(`"timestamp":`)
