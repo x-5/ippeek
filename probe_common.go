@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/netip"
 	"strings"
 	"sync"
 	"time"
 )
+
+// bindToDeviceHook overrides SO_BINDTODEVICE in tests on Linux.
+var bindToDeviceHook func(fd int, ifaceName string) error
 
 // IPFamily represents an IP protocol version (IPv4 or IPv6).
 type IPFamily int
@@ -63,7 +63,7 @@ type inflightCall struct {
 	err  error
 }
 
-// Prober queries external HTTP(S) IP echo endpoints with multi-source fallback,
+// Prober queries external IP echo endpoints with multi-source fallback,
 // in-memory TTL caching, and concurrent request coalescing.
 type Prober struct {
 	v4Probes []string
@@ -94,7 +94,7 @@ func NewProber(v4Probes, v6Probes []string, timeout, cacheTTL time.Duration) *Pr
 func (p *Prober) Probe(ctx context.Context, family IPFamily, ifaceName string, localIP net.IP, refresh bool) (ProbeResult, error) {
 	probes := p.probesFor(family)
 	if len(probes) == 0 {
-		return ProbeResult{}, fmt.Errorf("no %s probe endpoints configured", family)
+		return ProbeResult{}, errors.New("no " + family.String() + " probe endpoints configured")
 	}
 
 	key := probeKey{family: family, iface: ifaceName}
@@ -174,98 +174,20 @@ func (p *Prober) probesFor(family IPFamily) []string {
 	return p.v4Probes
 }
 
-func (p *Prober) probeAll(ctx context.Context, family IPFamily, probes []string, ifaceName string, localIP net.IP) (ProbeResult, error) {
-	dialer := &net.Dialer{
-		Timeout: p.timeout,
-	}
-	if localIP != nil {
-		dialer.LocalAddr = &net.TCPAddr{IP: localIP}
-	}
-	if ctrl := makeDialerControl(ifaceName); ctrl != nil {
-		dialer.Control = ctrl
-	}
-
-	netType := family.network()
-	transport := &http.Transport{
-		DialContext: func(dialCtx context.Context, _, addr string) (net.Conn, error) {
-			return dialer.DialContext(dialCtx, netType, addr)
-		},
-		DisableKeepAlives:     true,
-		TLSHandshakeTimeout:   p.timeout,
-		ResponseHeaderTimeout: p.timeout,
-	}
-	defer transport.CloseIdleConnections()
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   p.timeout,
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("too many redirects")
-			}
-			return nil
-		},
-	}
-
-	var lastErr error
-	for _, probeURL := range probes {
-		if ctx.Err() != nil {
-			return ProbeResult{}, ctx.Err()
-		}
-		ipStr, err := probeOne(ctx, client, family, probeURL)
-		if err == nil {
-			return ProbeResult{
-				IP:     ipStr,
-				Probe:  probeURL,
-				Cached: false,
-			}, nil
-		}
-		lastErr = fmt.Errorf("%s: %w", probeURL, err)
-	}
-
-	if lastErr == nil {
-		lastErr = fmt.Errorf("all %s probes failed", family)
-	}
-	return ProbeResult{}, lastErr
-}
-
-func probeOne(ctx context.Context, client *http.Client, family IPFamily, probeURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "ippeek/1.0")
-	req.Header.Set("Accept", "text/plain")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
-	}
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 128))
-	if err != nil {
-		return "", err
-	}
-
+func parseProbeIP(raw []byte, family IPFamily) (string, error) {
 	text := strings.TrimSpace(string(raw))
 	addr, err := netip.ParseAddr(text)
 	if err != nil {
-		return "", fmt.Errorf("invalid IP response %q", text)
+		return "", errors.New("invalid IP response")
 	}
 	if !addr.IsValid() || addr.IsUnspecified() || addr.IsMulticast() || addr.Is4In6() {
-		return "", fmt.Errorf("unusable IP response %q", text)
+		return "", errors.New("unusable IP response")
 	}
 	if family == FamilyV4 && !addr.Is4() {
-		return "", fmt.Errorf("expected IPv4, got %q", text)
+		return "", errors.New("expected IPv4")
 	}
 	if family == FamilyV6 && !addr.Is6() {
-		return "", fmt.Errorf("expected IPv6, got %q", text)
+		return "", errors.New("expected IPv6")
 	}
-
 	return addr.String(), nil
 }

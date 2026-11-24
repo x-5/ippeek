@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"sort"
@@ -13,6 +12,22 @@ import (
 
 // ErrInterfaceNotFound is returned when the requested network interface does not exist.
 var ErrInterfaceNotFound = errors.New("network interface not found")
+
+// ErrNoRoutableAddress is returned when an explicit interface cannot be bound for outbound probing.
+var ErrNoRoutableAddress = errors.New("interface has no routable address")
+
+type netWrapError struct {
+	msg string
+	err error
+}
+
+func (e *netWrapError) Error() string {
+	return e.msg
+}
+
+func (e *netWrapError) Unwrap() error {
+	return e.err
+}
 
 // SourceMode controls how an IP address is resolved.
 type SourceMode string
@@ -44,6 +59,7 @@ type IPResult struct {
 
 // OverviewResponse is the full JSON payload returned when format=json.
 type OverviewResponse struct {
+	Version    string          `json:"version,omitempty"`
 	IPv4       *IPResult       `json:"ipv4,omitempty"`
 	IPv6       *IPResult       `json:"ipv6,omitempty"`
 	Interfaces []InterfaceInfo `json:"interfaces,omitempty"`
@@ -208,7 +224,10 @@ func NewResolver(ifaces InterfaceProvider, prober ExternalProber) *Resolver {
 func (r *Resolver) Resolve(ctx context.Context, opts ResolveOptions) (ResolveOutput, error) {
 	allIfaces, err := r.ifaces.List()
 	if err != nil {
-		return ResolveOutput{}, fmt.Errorf("list interfaces: %w", err)
+		return ResolveOutput{}, &netWrapError{
+			msg: "list interfaces: " + err.Error(),
+			err: err,
+		}
 	}
 
 	var candidates []NetInterface
@@ -280,7 +299,7 @@ func (r *Resolver) resolveFamily(
 		}
 		return IPResult{
 			Iface: opts.Iface,
-			Error: fmt.Sprintf("no local %s address available", family),
+			Error: "no local " + family.String() + " address available",
 		}
 
 	case SourceAuto:
@@ -310,7 +329,7 @@ func (r *Resolver) probeExternal(
 	if r.prober == nil {
 		return IPResult{
 			Iface: opts.Iface,
-			Error: fmt.Sprintf("external %s prober not configured", family),
+			Error: "external " + family.String() + " prober not configured",
 		}
 	}
 

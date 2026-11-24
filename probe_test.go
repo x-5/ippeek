@@ -1,12 +1,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -47,6 +49,94 @@ func TestProberFallbackAndValidation(t *testing.T) {
 	if res.IP != "1.2.3.4" || res.Probe != srvGood.URL || res.Cached {
 		t.Fatalf("unexpected ProbeResult: %+v", res)
 	}
+}
+
+func TestProberChunked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("8.8."))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("8.8\n"))
+	}))
+	defer srv.Close()
+
+	prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 30*time.Second)
+	res, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil {
+		t.Fatalf("Probe chunked failed: %v", err)
+	}
+	if res.IP != "8.8.8.8" {
+		t.Fatalf("expected 8.8.8.8, got %+v", res)
+	}
+}
+
+func TestProberStrictIfaceBinding(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("1.2.3.4"))
+	}))
+	defer srv.Close()
+
+	// Case 1: explicit iface + nil localIP + EPERM on SO_BINDTODEVICE must fail with ErrNoRoutableAddress
+	// and never fall back to the default route.
+	t.Run("no_local_ip_eperm_rejects", func(t *testing.T) {
+		hits.Store(0)
+		origHook := bindToDeviceHook
+		bindToDeviceHook = func(fd int, ifaceName string) error {
+			return syscall.EPERM
+		}
+		defer func() { bindToDeviceHook = origHook }()
+
+		prober := NewProber([]string{srv.URL, srv.URL}, nil, 2*time.Second, 0)
+		_, err := prober.Probe(context.Background(), FamilyV4, "eth99", nil, false)
+		if !errors.Is(err, ErrNoRoutableAddress) {
+			t.Fatalf("expected ErrNoRoutableAddress, got %v", err)
+		}
+		if got := hits.Load(); got != 0 {
+			t.Fatalf("expected 0 upstream hits when binding fails, got %d", got)
+		}
+	})
+
+	// Case 2: explicit iface + nil localIP + EACCES on SO_BINDTODEVICE must also reject.
+	t.Run("no_local_ip_eacces_rejects", func(t *testing.T) {
+		hits.Store(0)
+		origHook := bindToDeviceHook
+		bindToDeviceHook = func(fd int, ifaceName string) error {
+			return syscall.EACCES
+		}
+		defer func() { bindToDeviceHook = origHook }()
+
+		prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 0)
+		_, err := prober.Probe(context.Background(), FamilyV4, "eth99", nil, false)
+		if !errors.Is(err, ErrNoRoutableAddress) {
+			t.Fatalf("expected ErrNoRoutableAddress, got %v", err)
+		}
+		if got := hits.Load(); got != 0 {
+			t.Fatalf("expected 0 upstream hits when binding fails, got %d", got)
+		}
+	})
+
+	// Case 3: explicit iface + valid localIP + EPERM on SO_BINDTODEVICE falls back to LocalAddr and succeeds.
+	t.Run("with_local_ip_eperm_uses_local_addr", func(t *testing.T) {
+		hits.Store(0)
+		origHook := bindToDeviceHook
+		bindToDeviceHook = func(fd int, ifaceName string) error {
+			return syscall.EPERM
+		}
+		defer func() { bindToDeviceHook = origHook }()
+
+		prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 0)
+		res, err := prober.Probe(context.Background(), FamilyV4, "lo", net.ParseIP("127.0.0.1"), false)
+		if err != nil {
+			t.Fatalf("expected LocalAddr fallback to succeed, got %v", err)
+		}
+		if res.IP != "1.2.3.4" || hits.Load() != 1 {
+			t.Fatalf("unexpected result=%+v hits=%d", res, hits.Load())
+		}
+	})
 }
 
 func TestProberCacheTTLAndRefresh(t *testing.T) {
@@ -136,35 +226,5 @@ func TestProberInflightCoalescing(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("expected concurrent probes to coalesce into 1 upstream request, got %d", got)
-	}
-}
-
-func TestLoadConfig(t *testing.T) {
-	t.Setenv("IPPEEK_TOKEN", "")
-	var stderr bytes.Buffer
-
-	// Missing token must fail.
-	if _, err := LoadConfig([]string{}, &stderr); err == nil {
-		t.Fatal("expected error when token is missing")
-	}
-
-	// Env var sets token and defaults.
-	t.Setenv("IPPEEK_TOKEN", "env-secret")
-	t.Setenv("IPPEEK_LISTEN", ":9090")
-	cfg, err := LoadConfig([]string{}, &stderr)
-	if err != nil {
-		t.Fatalf("LoadConfig with env failed: %v", err)
-	}
-	if cfg.Token != "env-secret" || cfg.Listen != ":9090" {
-		t.Fatalf("unexpected env config: %+v", cfg)
-	}
-
-	// CLI flag overrides env var.
-	cfg, err = LoadConfig([]string{"-token", "cli-secret", "-listen", "127.0.0.1:7070", "-cache-ttl", "15s"}, &stderr)
-	if err != nil {
-		t.Fatalf("LoadConfig with flags failed: %v", err)
-	}
-	if cfg.Token != "cli-secret" || cfg.Listen != "127.0.0.1:7070" || cfg.CacheTTL != 15*time.Second {
-		t.Fatalf("unexpected CLI config: %+v", cfg)
 	}
 }

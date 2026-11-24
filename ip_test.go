@@ -4,9 +4,14 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 )
 
 type stubInterfaceProvider struct {
@@ -201,5 +206,52 @@ func TestResolverLocalAndExternalAndNotFound(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInterfaceNotFound) {
 		t.Fatalf("expected ErrInterfaceNotFound, got %v", err)
+	}
+}
+
+func TestResolverStrictIfaceNoDefaultRouteLeak(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte("203.0.114.10"))
+	}))
+	defer srv.Close()
+
+	origHook := bindToDeviceHook
+	bindToDeviceHook = func(fd int, ifaceName string) error {
+		return syscall.EPERM
+	}
+	defer func() { bindToDeviceHook = origHook }()
+
+	ifaces := []NetInterface{
+		{
+			Name: "eth0",
+			Up:   true,
+			IPv4: []netip.Addr{netip.MustParseAddr("192.168.1.10")},
+		},
+		{
+			Name: "eth1",
+			Up:   true,
+			// Only link-local IPv4: no routable IPv4 address.
+			IPv4: []netip.Addr{netip.MustParseAddr("169.254.10.20")},
+		},
+	}
+
+	prober := NewProber([]string{srv.URL}, nil, 2*time.Second, 0)
+	r := NewResolver(stubInterfaceProvider{ifaces: ifaces}, prober)
+
+	out, err := r.Resolve(context.Background(), ResolveOptions{
+		Version: "4",
+		Iface:   "eth1",
+		Source:  SourceAuto,
+	})
+	if err != nil {
+		t.Fatalf("Resolve returned unexpected top-level error: %v", err)
+	}
+	if out.IPv4 == nil || out.IPv4.IP != "" || !strings.Contains(out.IPv4.Error, ErrNoRoutableAddress.Error()) {
+		t.Fatalf("expected ErrNoRoutableAddress error in IPv4 result, got %+v", out.IPv4)
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("expected 0 upstream hits (no default-route leak), got %d", hits.Load())
 	}
 }
