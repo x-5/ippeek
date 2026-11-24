@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# ip-api systemd one-click lifecycle manager: install | update | check | uninstall
-# Repo: https://github.com/x-5/ip-api
+# ippeek systemd one-click lifecycle manager: install | update | check | uninstall
+# Repo: https://github.com/x-5/ippeek
 
 set -euo pipefail
 
-APP_NAME="ip-api"
-DEFAULT_REPO="x-5/ip-api"
+APP_NAME="ippeek"
+DEFAULT_REPO="x-5/ippeek"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
 CONF_DIR="/etc/${APP_NAME}"
 ENV_FILE="${CONF_DIR}/${APP_NAME}.env"
@@ -40,15 +40,15 @@ Usage:
   sudo bash install.sh <install|update|check|uninstall> [options]
 
 Commands:
-  install     Download binary, write env/systemd unit, enable and start ip-api
-  update      Update ip-api binary to latest or specified version (keeps config)
+  install     Download binary, write env/systemd unit, enable and start ippeek
+  update      Update ippeek binary to latest or specified version (keeps config)
   check       Verify systemd status, binary info, logs, and loopback 444/200 checks
-  uninstall   Stop, disable, and remove ip-api service, binary, user, and config
+  uninstall   Stop, disable, and remove ippeek service, binary, user, and config
 
 Options:
   --variant <tiny-upx|tiny|std>  Binary variant (default: tiny-upx, or tiny on riscv64)
   --version <vX.Y.Z|latest>      Release tag to install/update (default: latest)
-  --repo <owner/repo>            GitHub repository (default: x-5/ip-api)
+  --repo <owner/repo>            GitHub repository (default: x-5/ippeek)
   --mirror <url-prefix>          Optional download proxy prefix (e.g. https://ghfast.top/)
   --local-bin <path>             Install/update from a local binary instead of downloading
   --listen <addr>                Listen address (default: :8080)
@@ -58,7 +58,7 @@ Options:
   --v4-probes <csv>              Custom IPv4 probe URLs (comma-separated)
   --v6-probes <csv>              Custom IPv6 probe URLs (comma-separated)
   --trust-proxy                  Trust X-Forwarded-For / X-Real-IP headers
-  --keep-config                  Preserve /etc/ip-api during uninstall
+  --keep-config                  Preserve /etc/ippeek during uninstall
   -h, --help                     Show this help
 
 Examples:
@@ -221,13 +221,13 @@ write_config_files() {
 	install -d -m 0750 -o root -g "${SVC_USER}" "${CONF_DIR}"
 
 	{
-		echo "IP_API_LISTEN=${LISTEN}"
-		echo "IP_API_TOKEN=${TOKEN}"
-		echo "IP_API_CACHE_TTL=${CACHE_TTL}"
-		echo "IP_API_PROBE_TIMEOUT=${PROBE_TIMEOUT}"
-		[ -n "${V4_PROBES}" ]   && echo "IP_API_V4_PROBES=${V4_PROBES}"
-		[ -n "${V6_PROBES}" ]   && echo "IP_API_V6_PROBES=${V6_PROBES}"
-		[ -n "${TRUST_PROXY}" ] && echo "IP_API_TRUST_PROXY=${TRUST_PROXY}"
+		echo "IPPEEK_LISTEN=${LISTEN}"
+		echo "IPPEEK_TOKEN=${TOKEN}"
+		echo "IPPEEK_CACHE_TTL=${CACHE_TTL}"
+		echo "IPPEEK_PROBE_TIMEOUT=${PROBE_TIMEOUT}"
+		[ -n "${V4_PROBES}" ]   && echo "IPPEEK_V4_PROBES=${V4_PROBES}"
+		[ -n "${V6_PROBES}" ]   && echo "IPPEEK_V6_PROBES=${V6_PROBES}"
+		[ -n "${TRUST_PROXY}" ] && echo "IPPEEK_TRUST_PROXY=${TRUST_PROXY}"
 	} > "${ENV_FILE}"
 	chown root:"${SVC_USER}" "${ENV_FILE}"
 	chmod 0640 "${ENV_FILE}"
@@ -418,8 +418,8 @@ cmd_check() {
 
 	if [ -r "${ENV_FILE}" ] && command -v curl >/dev/null 2>&1 && [ "${active}" = "active" ]; then
 		local env_listen env_token base_url
-		env_listen="$(sed -n 's/^IP_API_LISTEN=//p' "${ENV_FILE}" | head -n 1)"
-		env_token="$(sed -n 's/^IP_API_TOKEN=//p' "${ENV_FILE}" | head -n 1)"
+		env_listen="$(sed -n 's/^IPPEEK_LISTEN=//p' "${ENV_FILE}" | head -n 1)"
+		env_token="$(sed -n 's/^IPPEEK_TOKEN=//p' "${ENV_FILE}" | head -n 1)"
 		base_url="$(listen_to_loopback_url "${env_listen:-:8080}")"
 
 		# 1. Verify 444 connection-level drop (curl exit code 52 = Empty reply from server)

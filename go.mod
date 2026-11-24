@@ -1,3 +1,3 @@
-module ip-api
+module ippeek
 
 go 1.23

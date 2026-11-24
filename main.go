@@ -18,7 +18,7 @@ const maxConcurrentConns = 128
 func main() {
 	cfg, err := LoadConfig(os.Args[1:])
 	if err != nil {
-		_, _ = io.WriteString(os.Stderr, "[ip-api] config error: "+err.Error()+"\n")
+		_, _ = io.WriteString(os.Stderr, "[ippeek] config error: "+err.Error()+"\n")
 		os.Exit(1)
 	}
 
@@ -28,12 +28,12 @@ func main() {
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		_, _ = io.WriteString(os.Stderr, "[ip-api] listen error: "+err.Error()+"\n")
+		_, _ = io.WriteString(os.Stderr, "[ippeek] listen error: "+err.Error()+"\n")
 		os.Exit(1)
 	}
 
 	_, _ = io.WriteString(os.Stdout,
-		"[ip-api] listening on "+ln.Addr().String()+
+		"[ippeek] listening on "+ln.Addr().String()+
 			" (go-tiny cache_ttl="+cfg.CacheTTL.String()+
 			" probe_timeout="+cfg.ProbeTimeout.String()+
 			" v4_probes="+strconv.Itoa(len(cfg.V4Probes))+
@@ -50,7 +50,7 @@ func main() {
 
 	go func() {
 		sig := <-sigCh
-		_, _ = io.WriteString(os.Stdout, "[ip-api] received signal "+sig.String()+", shutting down...\n")
+		_, _ = io.WriteString(os.Stdout, "[ippeek] received signal "+sig.String()+", shutting down...\n")
 		cancel()
 		_ = ln.Close()
 	}()
@@ -82,5 +82,5 @@ func main() {
 	}
 
 	wg.Wait()
-	_, _ = io.WriteString(os.Stdout, "[ip-api] stopped cleanly\n")
+	_, _ = io.WriteString(os.Stdout, "[ippeek] stopped cleanly\n")
 }

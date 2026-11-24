@@ -418,7 +418,7 @@ func (h *ServerHandler) logLine(msg string) {
 	if h.logOut == nil {
 		return
 	}
-	line := "[ip-api] " + h.now().UTC().Format(time.RFC3339) + " " + msg + "\n"
+	line := "[ippeek] " + h.now().UTC().Format(time.RFC3339) + " " + msg + "\n"
 	h.logMu.Lock()
 	_, _ = io.WriteString(h.logOut, line)
 	h.logMu.Unlock()

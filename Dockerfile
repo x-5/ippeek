@@ -12,11 +12,11 @@ WORKDIR /src
 COPY go.mod *.go ./
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETARM} \
-    go build -trimpath -ldflags="-s -w" -o /out/ip-api . && \
-    (upx --best --lzma /out/ip-api || true)
+    go build -trimpath -ldflags="-s -w" -o /out/ippeek . && \
+    (upx --best --lzma /out/ippeek || true)
 
 FROM scratch
-COPY --from=builder /out/ip-api /ip-api
+COPY --from=builder /out/ippeek /ippeek
 
 EXPOSE 8080
-ENTRYPOINT ["/ip-api"]
+ENTRYPOINT ["/ippeek"]

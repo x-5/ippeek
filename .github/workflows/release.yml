@@ -63,15 +63,15 @@ jobs:
             )
           }
 
-          build_matrix src-std  ip-api-std
-          build_matrix src-tiny ip-api-tiny
+          build_matrix src-std  ippeek-std
+          build_matrix src-tiny ippeek-tiny
 
           for arch in linux-amd64 linux-arm64 linux-armv7 linux-armv6 linux-mipsle-softfloat linux-mips-softfloat windows-amd64.exe; do
-            cp "release-assets/ip-api-tiny-${arch}" "release-assets/ip-api-tiny-upx-${arch}"
-            upx --best --lzma -q "release-assets/ip-api-tiny-upx-${arch}"
+            cp "release-assets/ippeek-tiny-${arch}" "release-assets/ippeek-tiny-upx-${arch}"
+            upx --best --lzma -q "release-assets/ippeek-tiny-upx-${arch}"
           done
 
-          (cd release-assets && sha256sum ip-api-* > checksums.txt)
+          (cd release-assets && sha256sum ippeek-* > checksums.txt)
           ls -lh release-assets/
 
       - name: Publish GitHub Release

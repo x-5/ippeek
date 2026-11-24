@@ -30,22 +30,22 @@ type Config struct {
 // LoadConfig parses configuration from environment variables and CLI arguments without flag/fmt/reflect.
 func LoadConfig(args []string) (Config, error) {
 	cfg := Config{
-		Listen:       envOrDefault("IP_API_LISTEN", defaultListen),
-		Token:        strings.TrimSpace(os.Getenv("IP_API_TOKEN")),
+		Listen:       envOrDefault("IPPEEK_LISTEN", defaultListen),
+		Token:        strings.TrimSpace(os.Getenv("IPPEEK_TOKEN")),
 		CacheTTL:     defaultCacheTTL,
 		ProbeTimeout: defaultProbeTimeout,
-		V4Probes:     splitCSV(envOrDefault("IP_API_V4_PROBES", defaultV4Probes)),
-		V6Probes:     splitCSV(envOrDefault("IP_API_V6_PROBES", defaultV6Probes)),
+		V4Probes:     splitCSV(envOrDefault("IPPEEK_V4_PROBES", defaultV4Probes)),
+		V6Probes:     splitCSV(envOrDefault("IPPEEK_V6_PROBES", defaultV6Probes)),
 	}
 
 	var err error
-	if cfg.CacheTTL, err = envDurationOrDefault("IP_API_CACHE_TTL", defaultCacheTTL); err != nil {
+	if cfg.CacheTTL, err = envDurationOrDefault("IPPEEK_CACHE_TTL", defaultCacheTTL); err != nil {
 		return Config{}, err
 	}
-	if cfg.ProbeTimeout, err = envDurationOrDefault("IP_API_PROBE_TIMEOUT", defaultProbeTimeout); err != nil {
+	if cfg.ProbeTimeout, err = envDurationOrDefault("IPPEEK_PROBE_TIMEOUT", defaultProbeTimeout); err != nil {
 		return Config{}, err
 	}
-	if cfg.TrustProxy, err = envBoolOrDefault("IP_API_TRUST_PROXY", false); err != nil {
+	if cfg.TrustProxy, err = envBoolOrDefault("IPPEEK_TRUST_PROXY", false); err != nil {
 		return Config{}, err
 	}
 
@@ -70,7 +70,7 @@ func LoadConfig(args []string) (Config, error) {
 
 		switch name {
 		case "h", "help":
-			return Config{}, errors.New("usage: ip-api -token SECRET [-listen :8080] [-cache-ttl 60s] [-probe-timeout 3s] [-v4-probes ...] [-v6-probes ...] [-trust-proxy]")
+			return Config{}, errors.New("usage: ippeek -token SECRET [-listen :8080] [-cache-ttl 60s] [-probe-timeout 3s] [-v4-probes ...] [-v6-probes ...] [-trust-proxy]")
 		case "listen":
 			v, err := nextVal()
 			if err != nil {
@@ -134,7 +134,7 @@ func LoadConfig(args []string) (Config, error) {
 		return Config{}, errors.New("listen address must not be empty")
 	}
 	if cfg.Token == "" {
-		return Config{}, errors.New("token is required: set -token or IP_API_TOKEN")
+		return Config{}, errors.New("token is required: set -token or IPPEEK_TOKEN")
 	}
 	if cfg.CacheTTL < 0 {
 		return Config{}, errors.New("cache-ttl must be >= 0")

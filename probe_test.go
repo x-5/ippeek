@@ -162,14 +162,14 @@ func TestProberInflightCoalescing(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	t.Setenv("IP_API_TOKEN", "")
+	t.Setenv("IPPEEK_TOKEN", "")
 
 	if _, err := LoadConfig([]string{}); err == nil {
 		t.Fatal("expected error when token is missing")
 	}
 
-	t.Setenv("IP_API_TOKEN", "env-secret")
-	t.Setenv("IP_API_LISTEN", ":9090")
+	t.Setenv("IPPEEK_TOKEN", "env-secret")
+	t.Setenv("IPPEEK_LISTEN", ":9090")
 	cfg, err := LoadConfig([]string{})
 	if err != nil {
 		t.Fatalf("LoadConfig with env failed: %v", err)

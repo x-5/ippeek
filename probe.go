@@ -266,7 +266,7 @@ func probeHTTP(ctx context.Context, dialer *net.Dialer, family IPFamily, rawURL 
 	req.WriteString(reqPath)
 	req.WriteString(" HTTP/1.1\r\nHost: ")
 	req.WriteString(hostHeader)
-	req.WriteString("\r\nUser-Agent: ip-api/1.0\r\nAccept: text/plain\r\nConnection: close\r\n\r\n")
+	req.WriteString("\r\nUser-Agent: ippeek/1.0\r\nAccept: text/plain\r\nConnection: close\r\n\r\n")
 
 	if _, err := io.WriteString(conn, req.String()); err != nil {
 		return "", err
