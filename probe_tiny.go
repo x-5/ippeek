@@ -139,6 +139,7 @@ func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, raw
 	}
 
 	var chunked bool
+	var contentLength int64 = -1
 	headersDone := false
 	for i := 0; i < 64; i++ {
 		line, err := readProbeHeaderLine(br, 1024)
@@ -160,6 +161,10 @@ func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, raw
 			if strings.Contains(strings.ToLower(v), "chunked") {
 				chunked = true
 			}
+		case "content-length":
+			if cl, parseErr := strconv.ParseInt(v, 10, 64); parseErr == nil && cl >= 0 {
+				contentLength = cl
+			}
 		}
 	}
 	if !headersDone {
@@ -174,9 +179,15 @@ func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, raw
 	}
 
 	var rawBody []byte
-	if chunked {
+	switch {
+	case chunked:
 		rawBody, err = readChunkedLimited(br, 128)
-	} else {
+	case contentLength == 0:
+		rawBody = nil
+	case contentLength > 0 && contentLength <= 128:
+		rawBody = make([]byte, contentLength)
+		_, err = io.ReadFull(br, rawBody)
+	default:
 		rawBody, err = io.ReadAll(io.LimitReader(br, 128))
 	}
 	if err != nil {

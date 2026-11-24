@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -117,6 +119,57 @@ func TestProberRejectsRedirectsAndFallsBack(t *testing.T) {
 	}
 	if got := targetHits.Load(); got != 0 {
 		t.Fatalf("expected redirect target to still have 0 requests, got %d", got)
+	}
+}
+
+func TestProberKeepAliveContentLength(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		br := bufio.NewReader(conn)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil || line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+
+		// Respond with Content-Length and Connection: keep-alive, then intentionally delay closing.
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\n1.2.3.4\n")
+
+		select {
+		case <-release:
+		case <-time.After(3 * time.Second):
+		}
+	}()
+
+	probeURL := "http://" + ln.Addr().String() + "/"
+	prober := NewProber([]string{probeURL}, nil, 1*time.Second, 0)
+
+	start := time.Now()
+	res, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("keep-alive Content-Length probe failed after %v: %v", elapsed, err)
+	}
+	if res.IP != "1.2.3.4" {
+		t.Fatalf("expected 1.2.3.4, got %+v", res)
+	}
+	if elapsed >= 400*time.Millisecond {
+		t.Fatalf("expected immediate return via Content-Length, took %v", elapsed)
 	}
 }
 
