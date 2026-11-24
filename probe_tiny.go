@@ -34,7 +34,7 @@ func (p *Prober) probeAll(ctx context.Context, family IPFamily, probes []string,
 		if ctx.Err() != nil {
 			return ProbeResult{}, ctx.Err()
 		}
-		ipStr, err := probeHTTPTiny(ctx, dialer, family, probeURL, p.timeout, 0)
+		ipStr, err := probeHTTPTiny(ctx, dialer, family, probeURL, p.timeout)
 		if err == nil {
 			return ProbeResult{
 				IP:     ipStr,
@@ -89,10 +89,7 @@ func parseHTTPURL(raw string) (hostHeader, dialAddr, reqPath string, err error) 
 	return hostHeader, dialAddr, reqPath, nil
 }
 
-func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, rawURL string, timeout time.Duration, depth int) (string, error) {
-	if depth > 3 {
-		return "", errors.New("too many redirects")
-	}
+func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, rawURL string, timeout time.Duration) (string, error) {
 	hostHeader, dialAddr, reqPath, err := parseHTTPURL(rawURL)
 	if err != nil {
 		return "", err
@@ -142,7 +139,6 @@ func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, raw
 	}
 
 	var chunked bool
-	var location string
 	headersDone := false
 	for i := 0; i < 64; i++ {
 		line, err := readProbeHeaderLine(br, 1024)
@@ -164,16 +160,14 @@ func probeHTTPTiny(ctx context.Context, dialer *net.Dialer, family IPFamily, raw
 			if strings.Contains(strings.ToLower(v), "chunked") {
 				chunked = true
 			}
-		case "location":
-			location = v
 		}
 	}
 	if !headersDone {
 		return "", errors.New("too many response headers")
 	}
 
-	if (statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) && location != "" {
-		return probeHTTPTiny(ctx, dialer, family, location, timeout, depth+1)
+	if statusCode >= 300 && statusCode < 400 {
+		return "", errors.New("redirects are disabled (HTTP " + strconv.Itoa(statusCode) + ")")
 	}
 	if statusCode != 200 {
 		return "", errors.New("unexpected HTTP status " + strconv.Itoa(statusCode))

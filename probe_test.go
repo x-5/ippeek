@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -69,6 +70,53 @@ func TestProberChunked(t *testing.T) {
 	}
 	if res.IP != "8.8.8.8" {
 		t.Fatalf("expected 8.8.8.8, got %+v", res)
+	}
+}
+
+func TestProberRejectsRedirectsAndFallsBack(t *testing.T) {
+	var targetHits atomic.Int32
+	srvTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		_, _ = w.Write([]byte("10.0.0.1\n"))
+	}))
+	defer srvTarget.Close()
+
+	srv302 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvTarget.URL, http.StatusFound)
+	}))
+	defer srv302.Close()
+
+	srv301 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srvTarget.URL, http.StatusMovedPermanently)
+	}))
+	defer srv301.Close()
+
+	srvFallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("9.8.7.6\n"))
+	}))
+	defer srvFallback.Close()
+
+	// 302/301 redirects must be rejected without touching the redirect target and fall back to next probe.
+	prober := NewProber([]string{srv302.URL, srv301.URL, srvFallback.URL}, nil, 2*time.Second, 0)
+	res, err := prober.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err != nil {
+		t.Fatalf("expected fallback probe to succeed, got %v", err)
+	}
+	if res.IP != "9.8.7.6" || res.Probe != srvFallback.URL {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if got := targetHits.Load(); got != 0 {
+		t.Fatalf("expected redirect target to receive 0 requests, got %d", got)
+	}
+
+	// Single 302 probe must fail with a redirect error.
+	onlyRedirect := NewProber([]string{srv302.URL}, nil, 2*time.Second, 0)
+	_, err = onlyRedirect.Probe(context.Background(), FamilyV4, "", nil, false)
+	if err == nil || !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("expected redirect error, got %v", err)
+	}
+	if got := targetHits.Load(); got != 0 {
+		t.Fatalf("expected redirect target to still have 0 requests, got %d", got)
 	}
 }
 

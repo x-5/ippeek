@@ -41,11 +41,8 @@ func (p *Prober) probeAll(ctx context.Context, family IPFamily, probes []string,
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   p.timeout,
-		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("too many redirects")
-			}
-			return nil
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
 
@@ -92,6 +89,9 @@ func probeOneStd(ctx context.Context, client *http.Client, family IPFamily, prob
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return "", errors.New("redirects are disabled (HTTP " + strconv.Itoa(resp.StatusCode) + ")")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", errors.New("unexpected HTTP status " + strconv.Itoa(resp.StatusCode))
 	}
