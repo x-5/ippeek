@@ -1,97 +1,99 @@
 # ippeek
 
-超精简、零第三方依赖的 Go IP 查询 API 服务器，支持指定网卡、公网 IPv4/IPv6 智能获取、纯文本/JSON 双格式以及全不合规请求 **444 连接级 0 字节丢弃**。
+**English** | [简体中文](README.zh-CN.md)
 
-## 架构概览
+An ultra-minimal, zero-dependency Go IP query API server featuring specific network interface binding, smart public IPv4/IPv6 resolution, plain-text/JSON dual output formats, and **444 connection-level 0-byte drop** for all non-conforming requests.
+
+## Architecture Overview
 
 ```text
-Client ──GET /ip?token=...──▶ 严格校验 (路径/方法/白名单/常量时间Token)
+Client ──GET /ip?token=...──▶ Strict Validation (path / method / query allowlist / constant-time token)
                                 │
-                  不合规 ───────┴───────▶ 444 连接级丢弃 (0 字节直接断连)
+                  Invalid ──────┴──────▶ 444 Connection Drop (0 bytes, immediate TCP close)
                                 │
-                    通过 ───────▼
-                           智能解析器 (Resolver)
-                           ├─ source=local    → 直读网卡 IP (含内网)
-                           ├─ source=auto     → 优先网卡公网 IP (排除内网/CGNAT/ULA)
-                           │                    未命中时回退外部探测 (TTL缓存+并发合并)
-                           └─ source=external → 强制外部探测 (支持绑定指定网卡出站)
+                    Valid ──────▼
+                           Smart Resolver
+                           ├─ source=local    → Read interface IP directly (including private IPs)
+                           ├─ source=auto     → Prefer public IP on interface (skip RFC1918/CGNAT/ULA)
+                           │                    Fall back to external probes (TTL cache + singleflight)
+                           └─ source=external → Force external probe (supports outbound iface binding)
                                 │
                                 ▼
-                  format=text (纯IP) / format=json (总体信息)
+                  format=text (raw IP) / format=json (full metadata)
 ```
 
-### 分支与 Release 版本
+### Branches & Release Variants
 
-| 版本 | 分支 | 说明 | 体积 (`linux/amd64`) |
+| Variant | Branch | Description | Size (`linux/amd64`) |
 | :--- | :--- | :--- | :---: |
-| **`std`**（标准版） | `master` | Go 标准库 `net/http`，支持 `http://` 与 `https://` 探测源 | ~5.6 MB |
-| **`tiny`**（精简版） | `go-tiny` | 去除 `net/http`/`reflect`，纯 `net` 手写 HTTP/1.1 与 JSON（仅 `http://` 探测源） | ~1.9 MB |
-| **`tiny-upx`**（压缩版） | `go-tiny` | `tiny` 版经 UPX (`--best --lzma`) 压缩，适合路由器/嵌入式 | **~658 KB** |
+| **`std`** (Standard) | `master` | Go standard library `net/http`; supports both `http://` and `https://` probes | ~5.6 MB |
+| **`tiny`** (Minimal) | `go-tiny` | Drops `net/http` and `reflect`; raw `net` HTTP/1.1 & JSON (`http://` probes only) | ~1.9 MB |
+| **`tiny-upx`** (Compressed) | `go-tiny` | `tiny` build packed with UPX (`--best --lzma`), ideal for routers/embedded devices | **~658 KB** |
 
-## 用法说明
+## Usage
 
-### 1. systemd 一键部署 / 更新 / 检查 / 卸载（Linux）
+### 1. One-Click systemd Deployment / Update / Check / Uninstall (Linux)
 
 ```bash
-# 一键部署（默认安装 tiny-upx，未传 --token 时自动生成随机密钥）
+# One-click install (defaults to tiny-upx; auto-generates a random token if --token is omitted)
 curl -fsSL https://raw.githubusercontent.com/x-5/ippeek/master/install.sh | \
   sudo bash -s -- install --token YOUR_SECRET --listen :8080
 
-# 指定版本部署（tiny-upx / tiny / std）
+# Install a specific variant (tiny-upx / tiny / std)
 sudo bash install.sh install --variant std --token YOUR_SECRET
 
-# 一键更新（保留 /etc/ippeek/ippeek.env 配置）
+# One-click update (preserves /etc/ippeek/ippeek.env)
 sudo bash install.sh update
 
-# 一键检查（服务状态 + 444 断连与鉴权回环自检 + 日志）
+# One-click health check (service status + 444 drop & auth loopback self-test + logs)
 sudo bash install.sh check
 
-# 一键卸载（追加 --keep-config 可保留配置）
+# One-click uninstall (add --keep-config to preserve config files)
 sudo bash install.sh uninstall
 ```
 
-### 2. 直接运行 / 环境变量
+### 2. Direct Execution / Environment Variables
 
-CLI 参数优先于环境变量（`-token` / `IPPEEK_TOKEN` 为必填）：
+CLI flags take precedence over environment variables (`-token` / `IPPEEK_TOKEN` is required):
 
 ```bash
 IPPEEK_TOKEN=YOUR_SECRET ./ippeek -listen :8080
 ```
 
-| 参数 | 环境变量 | 默认值 | 说明 |
+| Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-listen` | `IPPEEK_LISTEN` | `:8080` | 监听地址 |
-| `-token` | `IPPEEK_TOKEN` | **必填** | 鉴权 Token |
-| `-cache-ttl` | `IPPEEK_CACHE_TTL` | `60s` | 外部探测缓存 TTL（`0` 禁用） |
-| `-probe-timeout` | `IPPEEK_PROBE_TIMEOUT` | `3s` | 单次探测超时 |
-| `-v4-probes` | `IPPEEK_V4_PROBES` | `4.ipw.cn,ip.3322.net,api4.ipify.org,ipv4.icanhazip.com` | IPv4 探测源 |
-| `-v6-probes` | `IPPEEK_V6_PROBES` | `6.ipw.cn,api6.ipify.org,ipv6.icanhazip.com` | IPv6 探测源 |
-| `-trust-proxy` | `IPPEEK_TRUST_PROXY` | `false` | 信任反代头提取 `client_ip` |
+| `-listen` | `IPPEEK_LISTEN` | `:8080` | Listen address |
+| `-token` | `IPPEEK_TOKEN` | **Required** | Authentication token |
+| `-cache-ttl` | `IPPEEK_CACHE_TTL` | `60s` | External probe cache TTL (`0` disables caching) |
+| `-probe-timeout` | `IPPEEK_PROBE_TIMEOUT` | `3s` | Timeout per external probe |
+| `-v4-probes` | `IPPEEK_V4_PROBES` | `4.ipw.cn,ip.3322.net,api4.ipify.org,ipv4.icanhazip.com` | IPv4 probe endpoints |
+| `-v6-probes` | `IPPEEK_V6_PROBES` | `6.ipw.cn,api6.ipify.org,ipv6.icanhazip.com` | IPv6 probe endpoints |
+| `-trust-proxy` | `IPPEEK_TRUST_PROXY` | `false` | Trust reverse-proxy headers for `client_ip` |
 
-### 3. API 调用（唯一入口 `GET /ip`）
+### 3. API Endpoint (Single Entry: `GET /ip`)
 
-参数白名单：`token`（必填）、`v`（`4`/`6`/`all`）、`format`（`text`/`json`）、`iface`（网卡名）、`source`（`auto`/`local`/`external`）、`refresh`（`1`/`true`）。任何不合规请求均触发 444 断连。
+Query parameter allowlist: `token` (required), `v` (`4` / `6` / `all`), `format` (`text` / `json`), `iface` (network interface name), `source` (`auto` / `local` / `external`), `refresh` (`1` / `true`). Any non-conforming request triggers an immediate 444 connection drop.
 
 ```bash
-# 纯文本公网 IPv4 / IPv6（v=4/6 默认 text，无尾部换行）
+# Plain-text public IPv4 / IPv6 (v=4/6 defaults to text with no trailing newline)
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET&v=4"
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET&v=6"
 
-# 指定网卡（智能公网 / 仅本地内网）
+# Specific network interface (smart public IP / local-only IP)
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET&v=4&iface=eth0"
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET&v=4&iface=eth0&source=local"
 
-# 总体信息 JSON（v=all 默认 json）
+# Full JSON summary (v=all defaults to json)
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET"
 
-# 强制刷新缓存
+# Force refresh probe cache
 curl "http://127.0.0.1:8080/ip?token=YOUR_SECRET&v=4&refresh=1"
 ```
 
-### 4. Docker 编译与运行
+### 4. Building & Testing with Docker
 
 ```bash
-make test           # 运行全部单元测试与 444 TCP 断连测试
-make build-all      # 交叉编译全部硬件平台产物到 dist/
-make docker-image   # 构建 FROM scratch 运行镜像
+make test           # Run all unit tests and 444 TCP drop tests
+make build-all      # Cross-compile binaries for all platforms into dist/
+make docker-image   # Build minimal FROM scratch Docker image
 ```
