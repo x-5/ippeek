@@ -255,3 +255,149 @@ func TestResolverStrictIfaceNoDefaultRouteLeak(t *testing.T) {
 		t.Fatalf("expected 0 upstream hits (no default-route leak), got %d", hits.Load())
 	}
 }
+
+func TestParseProcIfInet6(t *testing.T) {
+	sample := strings.Join([]string{
+		"00000000000000000000000000000001 01 80 10 80       lo",
+		"240e03b1123400000000000000000001 02 40 00 20     eth0",
+		"240e03b112340000aabbccddeeff0011 02 40 00 01     eth0",
+		"240e03b1123400000000000000000002 02 40 00 00     eth0",
+		"240E03B1123400000000000000000003 02 40 00 21     eth0",
+		"short line",
+		"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz 02 40 00 00     eth0",
+		"240e03b1123400000000000000000004 02 40 00 zz     eth0",
+		"",
+	}, "\n")
+
+	got := parseProcIfInet6(sample)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d: %+v", len(got), got)
+	}
+	if f := got["lo"][netip.MustParseAddr("::1")]; f != 0x80 {
+		t.Fatalf("expected lo ::1 flags=0x80, got 0x%x", f)
+	}
+	eth0 := got["eth0"]
+	if len(eth0) != 4 {
+		t.Fatalf("expected 4 valid eth0 entries, got %d: %+v", len(eth0), eth0)
+	}
+	if f := eth0[netip.MustParseAddr("240e:3b1:1234::1")]; f != ifaFlagDeprecated {
+		t.Fatalf("expected deprecated flag 0x20, got 0x%x", f)
+	}
+	if f := eth0[netip.MustParseAddr("240e:3b1:1234:0:aabb:ccdd:eeff:11")]; f != ifaFlagTemporary {
+		t.Fatalf("expected temporary flag 0x01, got 0x%x", f)
+	}
+	if f := eth0[netip.MustParseAddr("240e:3b1:1234::2")]; f != 0x00 {
+		t.Fatalf("expected stable flag 0x00, got 0x%x", f)
+	}
+	if f := eth0[netip.MustParseAddr("240e:3b1:1234::3")]; f != (ifaFlagDeprecated | ifaFlagTemporary) {
+		t.Fatalf("expected deprecated|temporary 0x21, got 0x%x", f)
+	}
+}
+
+func TestIPv6AddressPriority(t *testing.T) {
+	depPub := netip.MustParseAddr("240e:3b1:1234::1")
+	tempPub := netip.MustParseAddr("240e:3b1:1234::abcd:ef01")
+	stablePub := netip.MustParseAddr("240e:3b1:1234::2")
+	ula := netip.MustParseAddr("fd12:3456::10")
+
+	t.Run("prefer_stable_over_temporary_and_skip_deprecated", func(t *testing.T) {
+		iface := NetInterface{
+			Name: "eth0",
+			Up:   true,
+			IPv6: []netip.Addr{depPub, tempPub, stablePub},
+			ipv6Flags: map[netip.Addr]uint32{
+				depPub:    ifaFlagDeprecated,
+				tempPub:   ifaFlagTemporary,
+				stablePub: 0x00,
+			},
+		}
+		prober := &stubProber{v6Res: ProbeResult{IP: "240e:ffff::1", Probe: "http://6.ipw.cn"}}
+		r := NewResolver(stubInterfaceProvider{ifaces: []NetInterface{iface}}, prober)
+
+		autoOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Source: SourceAuto})
+		if err != nil || autoOut.IPv6 == nil || autoOut.IPv6.IP != stablePub.String() || autoOut.IPv6.Source != "interface" {
+			t.Fatalf("auto mode expected stable %s, got %+v err=%v", stablePub, autoOut.IPv6, err)
+		}
+
+		localOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Iface: "eth0", Source: SourceLocal})
+		if err != nil || localOut.IPv6 == nil || localOut.IPv6.IP != stablePub.String() {
+			t.Fatalf("local mode expected stable %s, got %+v err=%v", stablePub, localOut.IPv6, err)
+		}
+
+		if outIP := pickOutboundLocalIP(iface, FamilyV6); outIP == nil || outIP.String() != stablePub.String() {
+			t.Fatalf("pickOutboundLocalIP expected %s, got %v", stablePub, outIP)
+		}
+	})
+
+	t.Run("use_temporary_when_no_stable_public", func(t *testing.T) {
+		iface := NetInterface{
+			Name: "eth0",
+			Up:   true,
+			IPv6: []netip.Addr{depPub, tempPub},
+			ipv6Flags: map[netip.Addr]uint32{
+				depPub:  ifaFlagDeprecated,
+				tempPub: ifaFlagTemporary,
+			},
+		}
+		r := NewResolver(stubInterfaceProvider{ifaces: []NetInterface{iface}}, &stubProber{})
+
+		autoOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Source: SourceAuto})
+		if err != nil || autoOut.IPv6 == nil || autoOut.IPv6.IP != tempPub.String() || autoOut.IPv6.Source != "interface" {
+			t.Fatalf("auto mode expected temporary %s, got %+v err=%v", tempPub, autoOut.IPv6, err)
+		}
+	})
+
+	t.Run("skip_deprecated_in_auto_and_local", func(t *testing.T) {
+		iface := NetInterface{
+			Name: "eth0",
+			Up:   true,
+			IPv6: []netip.Addr{depPub, ula},
+			ipv6Flags: map[netip.Addr]uint32{
+				depPub: ifaFlagDeprecated,
+				ula:    0x00,
+			},
+		}
+		prober := &stubProber{v6Res: ProbeResult{IP: "240e:9999::1", Probe: "http://6.ipw.cn"}}
+		r := NewResolver(stubInterfaceProvider{ifaces: []NetInterface{iface}}, prober)
+
+		// Auto mode must skip deprecated public IPv6 and fall back to external prober.
+		autoOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Source: SourceAuto})
+		if err != nil || autoOut.IPv6 == nil || autoOut.IPv6.IP != "240e:9999::1" || autoOut.IPv6.Source != "external" {
+			t.Fatalf("auto mode expected external fallback, got %+v err=%v", autoOut.IPv6, err)
+		}
+		if prober.v6Calls.Load() != 1 {
+			t.Fatalf("expected 1 external v6 probe call, got %d", prober.v6Calls.Load())
+		}
+
+		// Local mode must skip deprecated public IPv6 and select non-deprecated ULA.
+		localOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Iface: "eth0", Source: SourceLocal})
+		if err != nil || localOut.IPv6 == nil || localOut.IPv6.IP != ula.String() {
+			t.Fatalf("local mode expected non-deprecated ULA %s, got %+v err=%v", ula, localOut.IPv6, err)
+		}
+
+		// Outbound local IP must also skip deprecated public IPv6 and pick ULA.
+		if outIP := pickOutboundLocalIP(iface, FamilyV6); outIP == nil || outIP.String() != ula.String() {
+			t.Fatalf("pickOutboundLocalIP expected %s, got %v", ula, outIP)
+		}
+	})
+
+	t.Run("only_deprecated_returns_no_local_ipv6", func(t *testing.T) {
+		iface := NetInterface{
+			Name: "eth0",
+			Up:   true,
+			IPv6: []netip.Addr{depPub},
+			ipv6Flags: map[netip.Addr]uint32{
+				depPub: ifaFlagDeprecated,
+			},
+		}
+		r := NewResolver(stubInterfaceProvider{ifaces: []NetInterface{iface}}, &stubProber{})
+
+		localOut, err := r.Resolve(context.Background(), ResolveOptions{Version: "6", Iface: "eth0", Source: SourceLocal})
+		if err != nil || localOut.IPv6 == nil || localOut.IPv6.IP != "" || localOut.IPv6.Error == "" {
+			t.Fatalf("expected error when only deprecated IPv6 exists, got %+v err=%v", localOut.IPv6, err)
+		}
+		if outIP := pickOutboundLocalIP(iface, FamilyV6); outIP != nil {
+			t.Fatalf("expected nil outbound IP when only deprecated IPv6 exists, got %v", outIP)
+		}
+	})
+}

@@ -6,8 +6,15 @@ import (
 	"net"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+)
+
+// Linux IPv6 IFA_F_* address flags parsed from /proc/net/if_inet6.
+const (
+	ifaFlagTemporary  uint32 = 0x01 // IFA_F_TEMPORARY / IFA_F_SECONDARY
+	ifaFlagDeprecated uint32 = 0x20 // IFA_F_DEPRECATED
 )
 
 // ErrInterfaceNotFound is returned when the requested network interface does not exist.
@@ -70,12 +77,13 @@ type OverviewResponse struct {
 
 // NetInterface is the normalized internal representation of a host network interface.
 type NetInterface struct {
-	Name     string
-	Up       bool
-	Loopback bool
-	MAC      string
-	IPv4     []netip.Addr
-	IPv6     []netip.Addr
+	Name      string
+	Up        bool
+	Loopback  bool
+	MAC       string
+	IPv4      []netip.Addr
+	IPv6      []netip.Addr
+	ipv6Flags map[netip.Addr]uint32
 }
 
 // InterfaceProvider abstracts host network interface enumeration for testability.
@@ -93,13 +101,16 @@ func (OSInterfaceProvider) List() ([]NetInterface, error) {
 		return nil, err
 	}
 
+	ipv6FlagsByIface := readIPv6AddrFlags()
+
 	out := make([]NetInterface, 0, len(ifaces))
 	for _, iface := range ifaces {
 		ni := NetInterface{
-			Name:     iface.Name,
-			Up:       iface.Flags&net.FlagUp != 0,
-			Loopback: iface.Flags&net.FlagLoopback != 0,
-			MAC:      iface.HardwareAddr.String(),
+			Name:      iface.Name,
+			Up:        iface.Flags&net.FlagUp != 0,
+			Loopback:  iface.Flags&net.FlagLoopback != 0,
+			MAC:       iface.HardwareAddr.String(),
+			ipv6Flags: ipv6FlagsByIface[iface.Name],
 		}
 
 		addrs, err := iface.Addrs()
@@ -390,34 +401,51 @@ func findInterfaceIP(candidates []NetInterface, family IPFamily, publicOnly bool
 			continue
 		}
 		addrs := iface.IPv4
+		var flags map[netip.Addr]uint32
 		if family == FamilyV6 {
 			addrs = iface.IPv6
+			flags = iface.ipv6Flags
 		}
-		if addr, ok := pickAddr(addrs, publicOnly); ok {
+		if addr, ok := pickAddr(addrs, flags, publicOnly); ok {
 			return addr, iface.Name, true
 		}
 	}
 	return netip.Addr{}, "", false
 }
 
-func pickAddr(addrs []netip.Addr, publicOnly bool) (netip.Addr, bool) {
+func pickAddr(addrs []netip.Addr, flags map[netip.Addr]uint32, publicOnly bool) (netip.Addr, bool) {
 	if len(addrs) == 0 {
 		return netip.Addr{}, false
 	}
 	if publicOnly {
+		var tempFallback netip.Addr
 		for _, a := range addrs {
-			if IsPublicIP(a) {
+			if !IsPublicIP(a) {
+				continue
+			}
+			f := flags[a]
+			if f&ifaFlagDeprecated != 0 {
+				continue
+			}
+			if f&ifaFlagTemporary == 0 {
 				return a, true
 			}
+			if !tempFallback.IsValid() {
+				tempFallback = a
+			}
+		}
+		if tempFallback.IsValid() {
+			return tempFallback, true
 		}
 		return netip.Addr{}, false
 	}
 
-	// Local mode preference: public > non-link-local unicast (private/CGNAT/ULA) > loopback > link-local.
+	// Local mode preference: non-deprecated public (stable > temporary) >
+	// non-link-local unicast (stable > temporary) > loopback > link-local.
 	bestScore := -1
 	var best netip.Addr
 	for _, a := range addrs {
-		score := localAddrScore(a)
+		score := localAddrScore(a, flags[a])
 		if score > bestScore {
 			bestScore = score
 			best = a
@@ -429,14 +457,20 @@ func pickAddr(addrs []netip.Addr, publicOnly bool) (netip.Addr, bool) {
 	return best, true
 }
 
-func localAddrScore(a netip.Addr) int {
-	if !a.IsValid() || a.IsUnspecified() || a.IsMulticast() {
+func localAddrScore(a netip.Addr, flag uint32) int {
+	if !a.IsValid() || a.IsUnspecified() || a.IsMulticast() || flag&ifaFlagDeprecated != 0 {
 		return -1
 	}
 	if IsPublicIP(a) {
-		return 4
+		if flag&ifaFlagTemporary == 0 {
+			return 6
+		}
+		return 5
 	}
 	if a.IsGlobalUnicast() {
+		if flag&ifaFlagTemporary == 0 {
+			return 4
+		}
 		return 3
 	}
 	if a.IsLoopback() {
@@ -450,22 +484,110 @@ func localAddrScore(a netip.Addr) int {
 
 func pickOutboundLocalIP(iface NetInterface, family IPFamily) net.IP {
 	addrs := iface.IPv4
+	var flags map[netip.Addr]uint32
 	if family == FamilyV6 {
 		addrs = iface.IPv6
+		flags = iface.ipv6Flags
 	}
-	var fallback netip.Addr
+
+	bestScore := -1
+	var best netip.Addr
 	for _, a := range addrs {
-		if IsPublicIP(a) {
-			return net.IP(a.AsSlice())
+		if !a.IsValid() || a.IsUnspecified() || a.IsMulticast() || a.IsLinkLocalUnicast() || a.IsLoopback() {
+			continue
 		}
-		if !fallback.IsValid() && a.IsGlobalUnicast() && !a.IsLinkLocalUnicast() && !a.IsLoopback() {
-			fallback = a
+		f := flags[a]
+		if f&ifaFlagDeprecated != 0 {
+			continue
+		}
+		score := -1
+		if IsPublicIP(a) {
+			if f&ifaFlagTemporary == 0 {
+				score = 4
+			} else {
+				score = 3
+			}
+		} else if a.IsGlobalUnicast() {
+			if f&ifaFlagTemporary == 0 {
+				score = 2
+			} else {
+				score = 1
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			best = a
 		}
 	}
-	if fallback.IsValid() {
-		return net.IP(fallback.AsSlice())
+	if bestScore >= 0 && best.IsValid() {
+		return net.IP(best.AsSlice())
 	}
 	return nil
+}
+
+// parseProcIfInet6 parses Linux /proc/net/if_inet6 content into a per-interface map
+// of IPv6 address -> IFA_F_* flags.
+func parseProcIfInet6(content string) map[string]map[netip.Addr]uint32 {
+	var out map[string]map[netip.Addr]uint32
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		addrHex := fields[0]
+		if len(addrHex) != 32 {
+			continue
+		}
+		var b [16]byte
+		validHex := true
+		for i := 0; i < 16; i++ {
+			v, ok := parseHexByte(addrHex[i*2], addrHex[i*2+1])
+			if !ok {
+				validHex = false
+				break
+			}
+			b[i] = v
+		}
+		if !validHex {
+			continue
+		}
+		flagVal, err := strconv.ParseUint(fields[4], 16, 32)
+		if err != nil {
+			continue
+		}
+		addr := netip.AddrFrom16(b)
+		ifname := fields[5]
+		if out == nil {
+			out = make(map[string]map[netip.Addr]uint32)
+		}
+		if out[ifname] == nil {
+			out[ifname] = make(map[netip.Addr]uint32)
+		}
+		out[ifname][addr] = uint32(flagVal)
+	}
+	return out
+}
+
+func parseHexByte(hi, lo byte) (byte, bool) {
+	h, ok1 := parseHexNibble(hi)
+	l, ok2 := parseHexNibble(lo)
+	if !ok1 || !ok2 {
+		return 0, false
+	}
+	return (h << 4) | l, true
+}
+
+func parseHexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func toInterfaceInfos(candidates []NetInterface, explicit bool) []InterfaceInfo {
