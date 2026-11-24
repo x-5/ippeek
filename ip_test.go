@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -24,6 +25,7 @@ func (s stubInterfaceProvider) List() ([]NetInterface, error) {
 }
 
 type stubProber struct {
+	mu        sync.Mutex
 	v4Res     ProbeResult
 	v4Err     error
 	v6Res     ProbeResult
@@ -35,8 +37,10 @@ type stubProber struct {
 }
 
 func (s *stubProber) Probe(_ context.Context, family IPFamily, ifaceName string, localIP net.IP, _ bool) (ProbeResult, error) {
+	s.mu.Lock()
 	s.lastIface = ifaceName
 	s.lastIP = localIP
+	s.mu.Unlock()
 	if family == FamilyV6 {
 		s.v6Calls.Add(1)
 		return s.v6Res, s.v6Err
